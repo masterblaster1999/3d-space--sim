@@ -639,6 +639,12 @@ int main(int argc, char** argv) {
   // Flight assistance
   bool autopilot = false;
 
+  // Mouse flight (optional): mouse-driven pitch/yaw while the cursor is captured.
+  // Toggle with Right Mouse or M. Press Esc to release capture.
+  bool mouseFlight = false;
+  bool invertMouseY = false;
+  float mouseSensitivity = 0.010f; // normalized torque input per pixel (tune in UI)
+
   // Supercruise-lite
   bool supercruise = false;
   bool supercruiseAssist = true;
@@ -666,6 +672,24 @@ int main(int argc, char** argv) {
   Target target{};
 
   std::vector<ToastMsg> toasts;
+
+  auto setMouseFlight = [&](bool enabled) {
+    if (mouseFlight == enabled) return;
+    mouseFlight = enabled;
+
+    SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE);
+    SDL_ShowCursor(enabled ? SDL_DISABLE : SDL_ENABLE);
+
+    // Flush any pending relative motion so we don't get a "jump" on toggle.
+    int dx = 0, dy = 0;
+    (void)SDL_GetRelativeMouseState(&dx, &dy);
+
+    if (enabled) {
+      toast(toasts, "Mouse flight: ON (RMB/M to toggle, Esc to release)", 2.5);
+    } else {
+      toast(toasts, "Mouse flight: OFF", 1.5);
+    }
+  };
 
   auto respawnNearStation = [&](const sim::StarSystem& sys, std::size_t stationIdx) {
     if (sys.stations.empty()) {
@@ -831,12 +855,17 @@ int main(int argc, char** argv) {
   auto last = std::chrono::high_resolution_clock::now();
 
   SDL_SetRelativeMouseMode(SDL_FALSE);
+  SDL_ShowCursor(SDL_ENABLE);
 
   while (running) {
     // Timing
     auto now = std::chrono::high_resolution_clock::now();
     const double dtReal = std::chrono::duration<double>(now - last).count();
     last = now;
+
+    // Per-frame mouse deltas (used for mouse flight).
+    double mouseDx = 0.0;
+    double mouseDy = 0.0;
 
     // Events
     SDL_Event event;
@@ -847,7 +876,21 @@ int main(int argc, char** argv) {
       if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE) running = false;
 
       if (event.type == SDL_KEYDOWN && !event.key.repeat) {
-        if (event.key.keysym.sym == SDLK_ESCAPE) running = false;
+        if (event.key.keysym.sym == SDLK_ESCAPE) {
+          // Escape either releases mouse flight (if active) or quits.
+          if (mouseFlight) {
+            setMouseFlight(false);
+          } else {
+            running = false;
+          }
+        }
+
+        if (event.key.keysym.sym == SDLK_m) {
+          // Toggle mouse flight.
+          if (!io.WantCaptureKeyboard) {
+            setMouseFlight(!mouseFlight);
+          }
+        }
 
         if (event.key.keysym.sym == SDLK_F5) {
           sim::SaveGame s{};
@@ -970,7 +1013,7 @@ int main(int argc, char** argv) {
             toast(toasts, "Supercruise disengaged.", 1.5);
           } else {
             if (target.kind == TargetKind::None) {
-              toast(toasts, "Set a target (T for station) to use supercruise.", 2.5);
+              toast(toasts, "Set a target (T/B/N) to use supercruise.", 2.5);
             } else {
               supercruise = true;
               autopilot = false;
@@ -1010,6 +1053,52 @@ int main(int argc, char** argv) {
             } else {
               target.index = (target.index + 1) % currentSystem->stations.size();
             }
+          }
+        }
+
+        if (event.key.keysym.sym == SDLK_b) {
+          // Cycle planet targets (bodies) for supercruise.
+          if (!currentSystem->planets.empty()) {
+            if (target.kind != TargetKind::Planet) {
+              target.kind = TargetKind::Planet;
+              target.index = 0;
+            } else {
+              target.index = (target.index + 1) % currentSystem->planets.size();
+            }
+          }
+        }
+
+        if (event.key.keysym.sym == SDLK_n) {
+          // Cycle contacts (prefers living pirates).
+          if (!contacts.empty()) {
+            std::size_t start = (target.kind == TargetKind::Contact) ? (target.index + 1) : 0;
+            bool found = false;
+
+            // First pass: living pirates.
+            for (std::size_t i = 0; i < contacts.size(); ++i) {
+              std::size_t idx = (start + i) % contacts.size();
+              if (contacts[idx].alive && contacts[idx].pirate) {
+                target.kind = TargetKind::Contact;
+                target.index = idx;
+                found = true;
+                break;
+              }
+            }
+
+            // Second pass: any living contact.
+            if (!found) {
+              for (std::size_t i = 0; i < contacts.size(); ++i) {
+                std::size_t idx = (start + i) % contacts.size();
+                if (contacts[idx].alive) {
+                  target.kind = TargetKind::Contact;
+                  target.index = idx;
+                  found = true;
+                  break;
+                }
+              }
+            }
+
+            if (!found) toast(toasts, "No living contacts.", 2.0);
           }
         }
         if (event.key.keysym.sym == SDLK_y) target = Target{};
@@ -1107,6 +1196,19 @@ int main(int argc, char** argv) {
         }
       }
 
+      if (event.type == SDL_MOUSEMOTION) {
+        if (mouseFlight && !io.WantCaptureMouse) {
+          mouseDx += (double)event.motion.xrel;
+          mouseDy += (double)event.motion.yrel;
+        }
+      }
+
+      if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_RIGHT) {
+        if (!io.WantCaptureMouse) {
+          setMouseFlight(!mouseFlight);
+        }
+      }
+
       if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
         if (!io.WantCaptureMouse) {
           // Fire laser
@@ -1192,6 +1294,13 @@ int main(int argc, char** argv) {
       input.torqueLocal.z += (keys[SDL_SCANCODE_E] ? 1.0 : 0.0);
       input.torqueLocal.z -= (keys[SDL_SCANCODE_Q] ? 1.0 : 0.0);
 
+      // Mouse flight (captured mouse) feeds pitch/yaw.
+      if (mouseFlight) {
+        const double invY = invertMouseY ? -1.0 : 1.0;
+        input.torqueLocal.y += (double)mouseDx * (double)mouseSensitivity;
+        input.torqueLocal.x += (-(double)mouseDy) * (double)mouseSensitivity * invY;
+      }
+
       input.boost = keys[SDL_SCANCODE_LSHIFT] != 0;
       input.brake = keys[SDL_SCANCODE_X] != 0;
 
@@ -1253,6 +1362,11 @@ int main(int argc, char** argv) {
       }
     }
 
+    // Cargo affects normal handling: a fully-loaded ship accelerates and turns a bit worse.
+    const double cargoLoad = std::clamp(cargoMassKg(cargo) / std::max(1.0, cargoCapacityKg), 0.0, 1.0);
+    const double linHandlingMult = (1.0 - 0.25 * cargoLoad);
+    const double angHandlingMult = (1.0 - 0.20 * cargoLoad);
+
     // Supercruise-lite: fast in-system travel assist to current target.
     // Inspired by the "supercruise" style travel in games like Elite Dangerous.
     if (supercruise && !docked && !captureKeys && fsdState == FsdState::Idle) {
@@ -1266,6 +1380,9 @@ int main(int argc, char** argv) {
 
       if (interdicted) {
         supercruise = false;
+        // Restore normal handling immediately (we may have been in supercruise last frame).
+        ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2 * linHandlingMult);
+        ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2 * angHandlingMult);
         toast(toasts, "Supercruise blocked: hostile contact nearby.", 2.0);
       } else {
         std::optional<math::Vec3d> destPosKm;
@@ -1290,6 +1407,8 @@ int main(int argc, char** argv) {
 
         if (!destPosKm) {
           supercruise = false;
+          ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2 * linHandlingMult);
+          ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2 * angHandlingMult);
           toast(toasts, "Supercruise requires a station/planet target.", 2.0);
         } else {
           const math::Vec3d rel = *destPosKm - ship.positionKm();
@@ -1300,8 +1419,8 @@ int main(int argc, char** argv) {
             supercruise = false;
             // Drop to a safe approach speed relative to destination.
             ship.setVelocityKmS(destVelKmS + dir * 0.12);
-            ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2);
-            ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2);
+            ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2 * linHandlingMult);
+            ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2 * angHandlingMult);
             toast(toasts, "Dropped from supercruise.", 1.6);
           } else {
             // Crank the ship up for supercruise, but keep controls simple.
@@ -1331,8 +1450,8 @@ int main(int argc, char** argv) {
       }
     } else {
       // Restore normal handling when not in supercruise.
-      ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2);
-      ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2);
+      ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2 * linHandlingMult);
+      ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2 * angHandlingMult);
     }
 
     // Sim step
@@ -1987,6 +2106,14 @@ int main(int argc, char** argv) {
       ImGui::Text("Laser cooldown: %.2fs", playerLaserCooldown);
       ImGui::Text("Fuel: %.1f / %.1f", fuel, fuelMax);
 
+      {
+        const double cap = std::max(1.0, cargoCapacityKg);
+        const double load = std::clamp(cargoMassKg(cargo) / cap, 0.0, 1.0);
+        const double linMult = (1.0 - 0.25 * load);
+        const double angMult = (1.0 - 0.20 * load);
+        ImGui::Text("Cargo load: %.0f%%   Handling: x%.2f accel, x%.2f turn", load * 100.0, linMult, angMult);
+      }
+
       const double jrMax = fsdBaseRangeLy();
       const double jrNow = fsdCurrentRangeLy();
       ImGui::Text("FSD range: %.1f ly (current) / %.1f ly (max)", jrNow, jrMax);
@@ -2006,6 +2133,15 @@ int main(int argc, char** argv) {
       }
 
       ImGui::Checkbox("Autopilot (P)", &autopilot);
+
+      // Mouse flight settings
+      bool mf = mouseFlight;
+      if (ImGui::Checkbox("Mouse flight (M/RMB)", &mf)) {
+        setMouseFlight(mf);
+      }
+      ImGui::SameLine();
+      ImGui::Checkbox("Invert mouse Y", &invertMouseY);
+      ImGui::SliderFloat("Mouse sensitivity", &mouseSensitivity, 0.002f, 0.030f, "%.4f");
 
       if (supercruise) {
         ImGui::SameLine();
@@ -2031,7 +2167,7 @@ int main(int argc, char** argv) {
         ImGui::Text("Clearance: %s", clearance ? "GRANTED" : "NONE");
         ImGui::TextDisabled("Docking: request clearance (L), fly through slot, then press G.");
       } else {
-        ImGui::TextDisabled("Target: (none)  [T cycles stations]");
+        ImGui::TextDisabled("Target: (none)  [T stations, B planets, N contacts]");
       }
 
       ImGui::Separator();
@@ -2042,9 +2178,10 @@ int main(int argc, char** argv) {
       ImGui::TextDisabled("Controls:");
       ImGui::BulletText("Translate: WASD + R/F (up/down)");
       ImGui::BulletText("Rotate: Arrow keys + Q/E roll");
+      ImGui::BulletText("Mouse flight: Right Mouse / M (Esc to release)");
       ImGui::BulletText("Boost: LShift   Brake: X");
       ImGui::BulletText("Dampers: Z (on) / C (off)");
-      ImGui::BulletText("Target: T (cycle stations), Y (clear)");
+      ImGui::BulletText("Target: T (stations), B (planets), N (contacts), Y (clear)");
       ImGui::BulletText("Docking: L (request clearance), G (dock/undock)");
       ImGui::BulletText("Supercruise-lite: H (to target)");
       ImGui::BulletText("FSD jump: J (route hop or selected system)");
