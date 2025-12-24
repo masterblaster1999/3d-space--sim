@@ -2,6 +2,7 @@
 
 #include "stellar/core/Log.h"
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 
@@ -33,6 +34,7 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   // Ship meta / progression
   f << "fuel " << s.fuel << "\n";
   f << "fuelMax " << s.fuelMax << "\n";
+  f << "fsdRangeLy " << s.fsdRangeLy << "\n";
   f << "hull " << s.hull << "\n";
   f << "cargoCapacityKg " << s.cargoCapacityKg << "\n";
   f << "fsdReadyDay " << s.fsdReadyDay << "\n";
@@ -57,8 +59,19 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << m.deadlineDay << " "
       << (m.completed ? 1 : 0) << " "
       << (m.failed ? 1 : 0) << " "
-      << (m.cargoProvided ? 1 : 0)
+      << (m.cargoProvided ? 1 : 0) << " "
+      // Optional / newer fields (kept at end for backward compatibility)
+      << m.factionId << " "
+      << m.viaSystem << " " << m.viaStation << " "
+      << static_cast<int>(m.leg) << " "
+      << (m.scanned ? 1 : 0)
       << "\n";
+  }
+
+  // Reputation
+  f << "reputation " << s.reputation.size() << "\n";
+  for (const auto& r : s.reputation) {
+    f << "rep " << r.factionId << " " << r.rep << "\n";
   }
 
   f << "station_overrides " << s.stationOverrides.size() << "\n";
@@ -134,6 +147,8 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.fuel;
     } else if (key == "fuelMax") {
       f >> out.fuelMax;
+    } else if (key == "fsdRangeLy") {
+      f >> out.fsdRangeLy;
     } else if (key == "hull") {
       f >> out.hull;
     } else if (key == "cargoCapacityKg") {
@@ -153,24 +168,31 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         std::string tok;
         if (!(f >> tok) || tok != "mission") return false;
 
+        // Parse the rest of the mission line so we can be backward compatible
+        // with older saves that did not include newer fields.
+        std::string line;
+        std::getline(f, line);
+        std::istringstream iss(line);
+
         Mission m{};
         int type = 0;
         int commodity = 0;
         int completed = 0;
         int failed = 0;
         int cargoProvided = 0;
-        f >> m.id
-          >> type
-          >> m.fromSystem >> m.fromStation
-          >> m.toSystem >> m.toStation
-          >> commodity
-          >> m.units
-          >> m.targetNpcId
-          >> m.reward
-          >> m.deadlineDay
-          >> completed
-          >> failed
-          >> cargoProvided;
+
+        iss >> m.id
+            >> type
+            >> m.fromSystem >> m.fromStation
+            >> m.toSystem >> m.toStation
+            >> commodity
+            >> m.units
+            >> m.targetNpcId
+            >> m.reward
+            >> m.deadlineDay
+            >> completed
+            >> failed
+            >> cargoProvided;
 
         m.type = static_cast<MissionType>(type);
         m.commodity = static_cast<econ::CommodityId>(commodity);
@@ -178,7 +200,27 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         m.failed = (failed != 0);
         m.cargoProvided = (cargoProvided != 0);
 
+        // Optional fields (save version >= 3)
+        int leg = 0;
+        int scanned = 0;
+        if (iss >> m.factionId >> m.viaSystem >> m.viaStation >> leg >> scanned) {
+          m.leg = static_cast<core::u8>(std::clamp(leg, 0, 255));
+          m.scanned = (scanned != 0);
+        }
+
         out.missions.push_back(std::move(m));
+      }
+    } else if (key == "reputation") {
+      std::size_t n = 0;
+      f >> n;
+      out.reputation.clear();
+      out.reputation.reserve(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        std::string tok;
+        if (!(f >> tok) || tok != "rep") return false;
+        FactionReputation r{};
+        f >> r.factionId >> r.rep;
+        out.reputation.push_back(std::move(r));
       }
     } else if (key == "station_overrides") {
       std::size_t n = 0;
