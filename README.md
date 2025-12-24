@@ -1,147 +1,78 @@
-# StellarForge — C++ Procedural Space Simulation Framework (Starter)
+# StellarForge — Procedural Space Sim Prototype (C++20)
 
-This is a **starter C++20 framework** aimed at building a space simulation game with **deterministic procedural generation** (galaxy → star systems → planets).  
-The core simulation/proc library is intentionally lightweight and self-contained.
+A small C++20 procedural space-sim framework + an SDL2/OpenGL **3D prototype** you can evolve toward a Pioneer / Elite-style loop.
 
-This repo now also includes a **real-time prototype app** using **SDL2 + OpenGL** (optional; controlled via CMake options).
+This repo contains:
+- Deterministic **procedural generation** (galaxy → systems → planets → stations)
+- A streaming **Universe** with LRU caches
+- A real-time **flight prototype** with ship physics, docking, markets, and combat-lite threats
 
-It’s inspired by the *kind* of open-ended space adventure pioneered by games like **Pioneer** (exploration/trading across huge numbers of systems), but **all code here is original** and designed as a clean foundation you can extend.
+## What’s playable right now (prototype “feel” pass)
 
-## What you get in this template
+### Stations that exist in-world (with orientation)
+- Stations are placed on **orbits** in the current system.
+- Stations have **visible geometry** (ring + central body + a highlighted docking frame).
+- Stations slowly **spin**, so orientation matters when approaching.
 
-- **CMake** project layout (library + sandbox app)
-- Deterministic PRNG (**SplitMix64**) with stable seeding for repeatable worlds
-- **Procedural generation** modules:
-  - Galaxy generator (disc-like distribution)
-  - Star + planet generator (simple astrophysics-inspired heuristics)
-  - Name generator (syllable-based)
-  - Value noise + fBm utilities for future terrain/fields
-- A simple **Keplerian orbit** solver (elliptical orbit position in AU)
+### “Mail-slot” style docking (with clearance)
+- Target a station: **T** cycles stations.
+- Request docking clearance: **L** (must be in comms range).
+- Fly through the **mail-slot** (stay aligned, stay under speed limit).
+- Press **G** to dock / undock.
 
-New in this build:
+### Combat-lite loop (pirates + basic weapon)
+- Pirates periodically spawn as contacts and will **pursue and fire** on the player.
+- Player weapon: **laser (Left Mouse)**.
+- If you die: you **respawn** and lose cargo + 10% credits (so pirates matter).
+- Stations provide light **defensive fire** against pirates near the station.
 
-- **Streaming universe**: systems are generated **on-demand** (infinite indices) with an **LRU cache**
-- **Renderer layer**: a minimal OpenGL point renderer (GL function loading via SDL's `SDL_GL_GetProcAddress`)
-- **Player ship**: simple input + physics integration
-- **Factions + markets**: deterministic faction generation + per-system market generation
-- **Persistence**: lightweight save file (`savegame.txt`) for player/system/time/cargo
+### Market + basic services gating
+- **Buying/Selling is disabled unless docked at that station.**
+- While docked you can use a basic **Repair** service.
 
-Early gameplay loops added in this pass:
-
-- **Supercruise** (high-speed in-system travel) + **7-second rule** approach assist
-- **Docking corridors** + **request docking** clearance (traffic can deny)
-- **Station services gating** (market/refuel/repairs/missions require docking)
-- **FSD hyperspace jump** (fuel + cooldown + arrival near destination station)
-- **NPC traffic** (traders affect station inventories) + **simple interdictions**
-- **Fuel scoop + heat** loop (scoop near star, too close overheats)
-- **Missions**: courier, delivery cargo, bounty scan
+## Controls (quick)
+- Translate: **W/S** (forward/back), **A/D** (strafe), **R/F** (up/down)
+- Rotate: **Arrow keys** (pitch/yaw), **Q/E** (roll)
+- Boost: **LShift**   Brake: **X**
+- Dampers: **Z** on / **C** off
+- Target station: **T** (cycle), clear target: **Y**
+- Request clearance: **L**
+- Dock/Undock: **G**
+- Autopilot approach: **P**
+- Fire laser: **Left Mouse**
+- UI: **TAB** Galaxy, **F1** Flight, **F2** Market, **F3** Contacts
+- Save/Load: **F5 / F9**
+- Pause: **Space**
 
 ## Build
 
-By default the project builds:
+This is a CMake project.
 
-- `stellar` (core simulation/proc library)
-- `stellar_render` (OpenGL helper library)
-- `stellar_sandbox` (CLI)
-- `stellar_game` (SDL2/OpenGL prototype)
-- tests
-
-### Linux / macOS
+### Standard build (game + tests)
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-./build/apps/stellar_sandbox/stellar_sandbox --help
-```
-
-### Windows (Visual Studio / Developer PowerShell)
-```powershell
-cmake -S . -B build
-cmake --build build --config Release
-.\build\apps\stellar_sandbox\Release\stellar_sandbox.exe --help
-```
-
-If you only want the headless library + sandbox/tests (no SDL/OpenGL), configure with:
-
-```bash
-cmake -S . -B build -DSTELLAR_ENABLE_RENDER=OFF -DSTELLAR_ENABLE_IMGUI=OFF
-```
-
-(Legacy alias still supported: `-DSTELLAR_BUILD_GAME=OFF`)
-
-## Run the sandbox
-
-Sample N systems and print one system:
-```bash
-./stellar_sandbox --seed 12345 --systems 50 --pick 7
-```
-
-Print multiple systems:
-```bash
-./stellar_sandbox --seed 42 --systems 10 --list
-```
-
-Show orbital positions at a given time:
-```bash
-./stellar_sandbox --seed 42 --systems 5 --pick 0 --time 120
-```
-
-## Run the real-time prototype
-
-The `stellar_game` executable is built by default.
-
-### Dependencies
-
-- **SDL2** (development headers)
-- **OpenGL** (system OpenGL)
-
-If SDL2 isn't installed, CMake can fetch it automatically:
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTELLAR_FETCH_SDL2=ON
-cmake --build build -j
-```
-
-If you prefer system packages:
-
-- Debian/Ubuntu: `sudo apt install libsdl2-dev`
-- macOS: `brew install sdl2`
-
-Then:
-
-```bash
 ./build/apps/stellar_game/stellar_game
 ```
 
-The game will auto-load `savegame.txt` if present.
+### Headless build (core + tests only)
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTELLAR_ENABLE_RENDER=OFF -DSTELLAR_ENABLE_IMGUI=OFF
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
 
-This prototype now auto-saves periodically. Use `rm savegame.txt` to reset.
+### GitHub Actions / Autotools templates
+Some CI templates run `./configure && make`. This repo now includes a **compat** `configure` script + `Makefile` that delegate to CMake.
 
-### Controls (prototype)
+## Project structure
+- `include/stellar/...` core types, math, sim, econ, render
+- `src/...` implementations
+- `apps/stellar_game` SDL2/OpenGL prototype
+- `tests` unit tests (headless)
 
-- Flight:
-  - W/S: forward/back thrust
-  - A/D: strafe left/right
-  - Space/Ctrl: up/down
-  - Arrow keys: pitch/yaw
-  - Q/E: roll
-  - Shift: boost, X: brake, F: toggle dampers
-- Targeting / travel:
-  - T: cycle stations, Y: cycle planets, G: clear target
-  - B: toggle supercruise, PageUp/PageDown: throttle, Z: toggle supercruise assist
-  - 1..5: time acceleration (Pioneer-style; only when safe)
-- Docking:
-  - L: request docking
-  - P: toggle approach autopilot
-  - U: undock (when docked)
-- Ship systems:
-  - O: toggle fuel scoop
-- UI:
-  - F1 help, F2 nav, F3 station/services, F4 galaxy map, F5 missions
-
-## Next steps you can add easily
-
-- Proper scene graph + render batching
-- UI (ImGui) for market/cargo/ship stats
-- Hyperjump / travel rules using galaxy positions
-- More detailed economy: production chains, station inventories, price history
-- Persistence for visited systems, player reputation, mission log
+## Next “feel” upgrades worth doing
+- Supercruise + nav assist (“7-second rule”)
+- FSD/hyperspace loop (fuel + cooldown + arrival at station)
+- Missions (courier/delivery/bounty) + reputation
+- NPC traffic that actually moves station inventories/prices

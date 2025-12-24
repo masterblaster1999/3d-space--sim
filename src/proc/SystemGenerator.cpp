@@ -167,81 +167,109 @@ sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<si
     sys.planets.push_back(std::move(p));
   }
 
-  // Stations
-  const int nStations = std::max(0, stub.stationCount);
-  sys.stations.reserve(static_cast<std::size_t>(nStations));
+  
+// Stations
+const int nStations = std::max(0, stub.stationCount);
+sys.stations.reserve(static_cast<std::size_t>(nStations));
 
-  const sim::Faction* fac = findFaction(stub.factionId, factions);
-  const double fee = fac ? fac->taxRate : 0.02;
-  const double bias = fac ? fac->industryBias : 0.0;
+const sim::Faction* fac = findFaction(stub.factionId, factions);
+const double fee = fac ? fac->taxRate : 0.02;
+const double bias = fac ? fac->industryBias : 0.0;
 
-  // Place stations on simple orbits around the primary star.
-  // These are not meant to be "scientifically correct" yet; the goal is to provide
-  // stable reference points for gameplay (nav targets, traffic, docking).
-  double aSt = rng.range(0.10, 0.22);
+// Helper: physical/docking parameters.
+auto setStationPhysicals = [&](sim::Station& st) {
+  auto rr = [&](double a, double b) { return rng.range(a, b); };
 
-  auto setDockingByType = [&](sim::Station& st) {
-    using econ::StationType;
-    switch (st.type) {
-      case StationType::Outpost:
-        st.docking.radiusKm = rng.range(3.5, 5.5);
-        st.docking.commsRangeKm = 45000.0;
-        st.docking.corridorRadiusKm = 60.0;
-        st.docking.corridorLengthKm = 1400.0;
-        st.docking.speedLimitKmS = 0.10;
-        break;
-      case StationType::TradeHub:
-        st.docking.radiusKm = rng.range(7.0, 11.0);
-        st.docking.commsRangeKm = 70000.0;
-        st.docking.corridorRadiusKm = 120.0;
-        st.docking.corridorLengthKm = 2600.0;
-        st.docking.speedLimitKmS = 0.16;
-        break;
-      case StationType::Shipyard:
-        st.docking.radiusKm = rng.range(10.0, 16.0);
-        st.docking.commsRangeKm = 80000.0;
-        st.docking.corridorRadiusKm = 160.0;
-        st.docking.corridorLengthKm = 3200.0;
-        st.docking.speedLimitKmS = 0.18;
-        break;
-      default:
-        st.docking.radiusKm = rng.range(5.0, 9.0);
-        st.docking.commsRangeKm = 60000.0;
-        st.docking.corridorRadiusKm = 90.0;
-        st.docking.corridorLengthKm = 2000.0;
-        st.docking.speedLimitKmS = 0.13;
-        break;
-    }
-  };
+  double baseRadius = 6000.0;
+  double speed = 0.20;
 
-  for (int i = 0; i < nStations; ++i) {
-    sim::Station st{};
-    st.id = core::hashCombine(static_cast<core::u64>(stub.id), static_cast<core::u64>(i + 1));
-    st.name = ng.stationName(stub.name, i);
-    st.factionId = stub.factionId;
-    st.feeRate = fee;
-    st.type = pickStationType(rng, bias);
-    st.economyModel = econ::makeEconomyModel(st.type, bias);
-
-    // Orbit progression (similar to planets but tighter). Keep stations in the inner system
-    // for now so early travel isn't too punishing.
-    aSt *= rng.range(1.25, 1.6);
-    aSt += rng.range(0.015, 0.06);
-    aSt = std::min(aSt, 8.0);
-
-    st.orbit.semiMajorAxisAU = aSt;
-    st.orbit.eccentricity = rng.range(0.0, 0.07);
-    st.orbit.inclinationRad = rng.range(0.0, stellar::math::degToRad(3.0));
-    st.orbit.ascendingNodeRad = rng.range(0.0, 2.0*stellar::math::kPi);
-    st.orbit.argPeriapsisRad = rng.range(0.0, 2.0*stellar::math::kPi);
-    st.orbit.meanAnomalyAtEpochRad = rng.range(0.0, 2.0*stellar::math::kPi);
-    st.orbit.epochDays = 0.0;
-    const double years = std::sqrt((aSt*aSt*aSt) / std::max(0.08, sys.star.massSol));
-    st.orbit.periodDays = years * 365.25;
-
-    setDockingByType(st);
-    sys.stations.push_back(std::move(st));
+  switch (st.type) {
+    case econ::StationType::Outpost:
+      baseRadius = 4500.0;
+      speed = 0.18;
+      break;
+    case econ::StationType::Mining:
+      baseRadius = 6500.0;
+      speed = 0.20;
+      break;
+    case econ::StationType::Refinery:
+      baseRadius = 7000.0;
+      speed = 0.20;
+      break;
+    case econ::StationType::Agricultural:
+      baseRadius = 6500.0;
+      speed = 0.22;
+      break;
+    case econ::StationType::Industrial:
+      baseRadius = 8000.0;
+      speed = 0.22;
+      break;
+    case econ::StationType::Research:
+      baseRadius = 6000.0;
+      speed = 0.20;
+      break;
+    case econ::StationType::TradeHub:
+      baseRadius = 11000.0;
+      speed = 0.25;
+      break;
+    case econ::StationType::Shipyard:
+      baseRadius = 13000.0;
+      speed = 0.28;
+      break;
+    default:
+      break;
   }
+
+  st.radiusKm = baseRadius * rr(0.85, 1.20);
+
+  // Slot scaled off radius.
+  st.slotWidthKm  = st.radiusKm * rr(0.75, 0.95);
+  st.slotHeightKm = st.radiusKm * rr(0.30, 0.45);
+  st.slotDepthKm  = st.radiusKm * rr(0.90, 1.35);
+
+  // Approach corridor
+  st.approachLengthKm = st.radiusKm * rr(8.0, 14.0);
+  st.approachRadiusKm = st.radiusKm * rr(1.2, 2.2);
+  st.maxApproachSpeedKmS = speed * rr(0.85, 1.15);
+
+  // Comms range for clearance
+  st.commsRangeKm = st.radiusKm * rr(10.0, 16.0);
+};
+
+for (int i = 0; i < nStations; ++i) {
+  sim::Station st{};
+  st.id = core::hashCombine(static_cast<core::u64>(stub.id), static_cast<core::u64>(i + 1));
+  st.name = ng.stationName(stub.name, i);
+  st.factionId = stub.factionId;
+  st.feeRate = fee;
+  st.type = pickStationType(rng, bias);
+  st.economyModel = econ::makeEconomyModel(st.type, bias);
+
+  // Place stations on simple orbits around the primary.
+  // Prefer to place near an existing planet orbit (feels like inhabited space), else pick a random AU.
+  double aAU = rng.range(0.8, 5.5);
+  if (!sys.planets.empty()) {
+    const int idx = rng.range<int>(0, (int)sys.planets.size() - 1);
+    aAU = sys.planets[(std::size_t)idx].orbit.semiMajorAxisAU * rng.range(0.92, 1.08);
+  }
+
+  st.orbit.semiMajorAxisAU = std::max(0.35, aAU);
+  st.orbit.eccentricity = rng.range(0.0, 0.06);
+  st.orbit.inclinationRad = rng.range(0.0, stellar::math::degToRad(3.0));
+  st.orbit.ascendingNodeRad = rng.range(0.0, 2.0*stellar::math::kPi);
+  st.orbit.argPeriapsisRad = rng.range(0.0, 2.0*stellar::math::kPi);
+  st.orbit.meanAnomalyAtEpochRad = rng.range(0.0, 2.0*stellar::math::kPi);
+  st.orbit.epochDays = 0.0;
+
+  const double years = std::sqrt((st.orbit.semiMajorAxisAU*st.orbit.semiMajorAxisAU*st.orbit.semiMajorAxisAU) /
+                                 std::max(0.08, sys.star.massSol));
+  st.orbit.periodDays = years * 365.25;
+
+  setStationPhysicals(st);
+
+  sys.stations.push_back(std::move(st));
+}
+
 
   return sys;
 }

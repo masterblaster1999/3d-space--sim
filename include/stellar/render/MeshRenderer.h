@@ -8,11 +8,19 @@
 
 namespace stellar::render {
 
+// NOTE: This struct is tightly packed as floats and uploaded to the GPU.
+// Layout must match the vertex shader instance attributes.
 struct InstanceData {
+  // World position (render units)
   float px, py, pz;
-  float scale;
-  // Rotation quaternion (x,y,z,w). Use identity (0,0,0,1) for no rotation.
+
+  // Non-uniform scale (render units)
+  float sx, sy, sz;
+
+  // Rotation quaternion (x,y,z,w)
   float qx, qy, qz, qw;
+
+  // Base color multiplier
   float cr, cg, cb;
 };
 

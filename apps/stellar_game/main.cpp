@@ -1,18 +1,12 @@
-#include "stellar/core/Hash.h"
 #include "stellar/core/Log.h"
 #include "stellar/core/Random.h"
-#include "stellar/econ/Commodity.h"
 #include "stellar/econ/Market.h"
-#include "stellar/math/Math.h"
-#include "stellar/math/Mat4.h"
-#include "stellar/math/Vec3.h"
-#include "stellar/proc/NameGenerator.h"
+#include "stellar/econ/RoutePlanner.h"
 #include "stellar/render/Camera.h"
 #include "stellar/render/Gl.h"
 #include "stellar/render/LineRenderer.h"
 #include "stellar/render/Mesh.h"
 #include "stellar/render/MeshRenderer.h"
-#include "stellar/render/PointRenderer.h"
 #include "stellar/render/Texture.h"
 #include "stellar/sim/Orbit.h"
 #include "stellar/sim/SaveGame.h"
@@ -20,461 +14,363 @@
 #include "stellar/sim/Universe.h"
 
 #include <SDL.h>
+#include <SDL_opengl.h>
+
+#include <imgui.h>
+#include <backends/imgui_impl_opengl3.h>
+#include <backends/imgui_impl_sdl2.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
-#include <cstdint>
-#include <cstdio>
 #include <cstring>
-#include <deque>
-#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
-// Dear ImGui
-#include "imgui.h"
-#include "imgui_impl_opengl3.h"
-#include "imgui_impl_sdl2.h"
+using namespace stellar;
 
-// ------------ Constants / helpers ------------
+static constexpr double kAU_KM = 149597870.7;
+static constexpr double kSOLAR_RADIUS_KM = 695700.0;
+static constexpr double kEARTH_RADIUS_KM = 6371.0;
 
-static constexpr double kAuKm = 149597870.7;
-static constexpr double kLyKm = 9.4607304725808e12;
-static constexpr double kSolarRadiusKm = 695700.0;
+// Rendering scale:
+// The sim uses kilometers. For rendering, we scale down by this factor.
+static constexpr double kRENDER_UNIT_KM = 1.0e6; // 1 unit = 1 million km
 
-static double auToKm(double au) { return au * kAuKm; }
-
-static stellar::math::Vec3d auToKm(const stellar::math::Vec3d& p) {
-  return {p.x * kAuKm, p.y * kAuKm, p.z * kAuKm};
+static void matToFloat(const math::Mat4d& m, float out[16]) {
+  for (int i = 0; i < 16; ++i) out[i] = static_cast<float>(m.m[i]);
 }
 
-struct Vec4d {
-  double x{0}, y{0}, z{0}, w{1};
-};
+static const char* starClassName(sim::StarClass c) {
+  switch (c) {
+    case sim::StarClass::O: return "O";
+    case sim::StarClass::B: return "B";
+    case sim::StarClass::A: return "A";
+    case sim::StarClass::F: return "F";
+    case sim::StarClass::G: return "G";
+    case sim::StarClass::K: return "K";
+    case sim::StarClass::M: return "M";
+    default: return "?";
+  }
+}
 
-static Vec4d mul(const stellar::math::Mat4d& m, const Vec4d& v) {
-  // Column-major
-  return {
-    m.m[0] * v.x + m.m[4] * v.y + m.m[8] * v.z + m.m[12] * v.w,
-    m.m[1] * v.x + m.m[5] * v.y + m.m[9] * v.z + m.m[13] * v.w,
-    m.m[2] * v.x + m.m[6] * v.y + m.m[10] * v.z + m.m[14] * v.w,
-    m.m[3] * v.x + m.m[7] * v.y + m.m[11] * v.z + m.m[15] * v.w,
+static const char* stationTypeName(econ::StationType t) {
+  switch (t) {
+    case econ::StationType::Outpost: return "Outpost";
+    case econ::StationType::Agricultural: return "Agricultural";
+    case econ::StationType::Mining: return "Mining";
+    case econ::StationType::Refinery: return "Refinery";
+    case econ::StationType::Industrial: return "Industrial";
+    case econ::StationType::Research: return "Research";
+    case econ::StationType::TradeHub: return "Trade Hub";
+    case econ::StationType::Shipyard: return "Shipyard";
+    default: return "?";
+  }
+}
+
+static math::Vec3d toRenderU(const math::Vec3d& km) { return km * (1.0 / kRENDER_UNIT_KM); }
+
+static math::Quatd quatFromTo(const math::Vec3d& from, const math::Vec3d& to) {
+  math::Vec3d f = from.normalized();
+  math::Vec3d t = to.normalized();
+  const double c = std::clamp(math::dot(f, t), -1.0, 1.0);
+
+  if (c > 0.999999) return math::Quatd::identity();
+
+  if (c < -0.999999) {
+    math::Vec3d axis = math::cross({1,0,0}, f);
+    if (axis.lengthSq() < 1e-12) axis = math::cross({0,1,0}, f);
+    return math::Quatd::fromAxisAngle(axis, math::kPi);
+  }
+
+  const math::Vec3d axis = math::cross(f, t);
+  const double s = std::sqrt((1.0 + c) * 2.0);
+  const double invs = 1.0 / s;
+  return math::Quatd{ s * 0.5, axis.x * invs, axis.y * invs, axis.z * invs }.normalized();
+}
+
+static math::Vec3d stationPosKm(const sim::Station& st, double timeDays) {
+  const math::Vec3d posAU = sim::orbitPosition3DAU(st.orbit, timeDays);
+  return posAU * kAU_KM;
+}
+
+static math::Vec3d stationVelKmS(const sim::Station& st, double timeDays) {
+  // Numeric derivative over a short window.
+  const double epsDays = 0.001; // 86.4s
+  const math::Vec3d a = stationPosKm(st, timeDays - epsDays);
+  const math::Vec3d b = stationPosKm(st, timeDays + epsDays);
+  const double dt = epsDays * 2.0 * 86400.0;
+  return (b - a) * (1.0 / dt);
+}
+
+static math::Quatd stationOrient(const sim::Station& st, const math::Vec3d& posKm, double timeDays) {
+  // Station local +Z points outward from the slot.
+  // We point it away from the star (radial outward) for intuitive docking.
+  math::Vec3d outward = posKm.normalized();
+  if (outward.lengthSq() < 1e-12) outward = {0,0,1};
+  math::Quatd base = quatFromTo({0,0,1}, outward);
+
+  // Add a small spin to make orientation/geometry feel alive.
+  // Spin around the station's local +Z axis.
+  const double spinRadPerDay = math::degToRad(35.0);
+  math::Quatd spin = math::Quatd::fromAxisAngle({0,0,1}, std::fmod(timeDays * spinRadPerDay, 2.0 * math::kPi));
+  return (base * spin).normalized();
+}
+
+static render::InstanceData makeInst(const math::Vec3d& posU,
+                                    const math::Vec3d& scaleU,
+                                    const math::Quatd& qWorld,
+                                    float cr, float cg, float cb) {
+  // shader expects quat as x,y,z,w
+  const math::Quatd q = qWorld.normalized();
+  return render::InstanceData{
+    (float)posU.x, (float)posU.y, (float)posU.z,
+    (float)scaleU.x, (float)scaleU.y, (float)scaleU.z,
+    (float)q.x, (float)q.y, (float)q.z, (float)q.w,
+    cr, cg, cb
   };
 }
 
-static stellar::math::Vec3d planetPosKm(const stellar::sim::Planet& p, double timeDays) {
-  return auToKm(stellar::sim::orbitPosition3DAU(p.orbit, timeDays));
+static render::InstanceData makeInstUniform(const math::Vec3d& posU,
+                                           double s,
+                                           float cr, float cg, float cb) {
+  return makeInst(posU, {s,s,s}, math::Quatd::identity(), cr,cg,cb);
 }
 
-static stellar::math::Vec3d stationPosKm(const stellar::sim::Station& st, double timeDays) {
-  return auToKm(stellar::sim::orbitPosition3DAU(st.orbit, timeDays));
+static bool projectToScreen(const math::Vec3d& worldU,
+                            const math::Mat4d& view,
+                            const math::Mat4d& proj,
+                            int w, int h,
+                            ImVec2& outPx) {
+  // clip = proj * view * vec4(world, 1)
+  const math::Mat4d vp = proj * view;
+  const double x = worldU.x, y = worldU.y, z = worldU.z;
+
+  const double cx = vp.m[0]*x + vp.m[4]*y + vp.m[8]*z + vp.m[12];
+  const double cy = vp.m[1]*x + vp.m[5]*y + vp.m[9]*z + vp.m[13];
+  const double cz = vp.m[2]*x + vp.m[6]*y + vp.m[10]*z + vp.m[14];
+  const double cw = vp.m[3]*x + vp.m[7]*y + vp.m[11]*z + vp.m[15];
+
+  if (cw <= 1e-6) return false;
+
+  const double ndcX = cx / cw;
+  const double ndcY = cy / cw;
+  // const double ndcZ = cz / cw;
+
+  // off-screen (still allow a bit of slack)
+  if (ndcX < -1.2 || ndcX > 1.2 || ndcY < -1.2 || ndcY > 1.2) return false;
+
+  outPx.x = (float)((ndcX * 0.5 + 0.5) * (double)w);
+  outPx.y = (float)((-ndcY * 0.5 + 0.5) * (double)h);
+  return true;
 }
 
-static stellar::math::Vec3d orbitVelKmS(const stellar::sim::OrbitElements& orbit, double timeDays) {
-  // Finite-difference velocity.
-  const double dtDays = 10.0 / 86400.0; // 10 seconds
-  const stellar::math::Vec3d p0 = auToKm(stellar::sim::orbitPosition3DAU(orbit, timeDays));
-  const stellar::math::Vec3d p1 = auToKm(stellar::sim::orbitPosition3DAU(orbit, timeDays + dtDays));
-  const stellar::math::Vec3d vKmPerDay = (p1 - p0) / dtDays;
-  return vKmPerDay / 86400.0;
-}
+static bool beginStationSelectorHUD(const sim::StarSystem& sys, int& stationIndex, bool docked, sim::StationId dockedId) {
+  bool changed = false;
 
-static ImVec2 worldToScreen(const stellar::math::Mat4d& view,
-                            const stellar::math::Mat4d& proj,
-                            const stellar::math::Vec3d& world,
-                            const ImVec2& viewportSize,
-                            bool* outBehind = nullptr) {
-  const Vec4d clip = mul(proj, mul(view, Vec4d{world.x, world.y, world.z, 1.0}));
-  if (outBehind) *outBehind = (clip.w <= 0.0);
+  ImGui::Begin("Dock / Station");
 
-  if (std::abs(clip.w) < 1e-9) return {-10000, -10000};
+  ImGui::Text("System: %s  (Star %s, planets %d, stations %d)",
+              sys.stub.name.c_str(),
+              starClassName(sys.stub.primaryClass),
+              sys.stub.planetCount,
+              sys.stub.stationCount);
 
-  const double ndcX = clip.x / clip.w;
-  const double ndcY = clip.y / clip.w;
+  if (!sys.stations.empty()) {
+    std::vector<const char*> names;
+    names.reserve(sys.stations.size());
+    for (const auto& st : sys.stations) names.push_back(st.name.c_str());
 
-  // NDC (-1..1) to screen
-  const float sx = static_cast<float>((ndcX * 0.5 + 0.5) * viewportSize.x);
-  const float sy = static_cast<float>((-ndcY * 0.5 + 0.5) * viewportSize.y);
-  return {sx, sy};
-}
+    int old = stationIndex;
+    ImGui::Combo("Station", &stationIndex, names.data(), (int)names.size());
+    changed = (old != stationIndex);
 
-static stellar::render::Texture2D makeCheckerTexture(int w, int h) {
-  std::vector<std::uint8_t> data(static_cast<std::size_t>(w * h * 4));
-  for (int y = 0; y < h; ++y) {
-    for (int x = 0; x < w; ++x) {
-      const bool c = ((x / 8) % 2) ^ ((y / 8) % 2);
-      const std::uint8_t v = c ? 200 : 60;
-      std::size_t idx = static_cast<std::size_t>((y * w + x) * 4);
-      data[idx + 0] = v;
-      data[idx + 1] = v;
-      data[idx + 2] = v;
-      data[idx + 3] = 255;
-    }
-  }
-  stellar::render::Texture2D tex;
-  tex.uploadRGBA(w, h, data.data());
-  return tex;
-}
+    const auto& st = sys.stations[(std::size_t)stationIndex];
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%s, fee %.1f%%)", stationTypeName(st.type), st.feeRate * 100.0);
 
-static const char* stationTypeName(stellar::econ::StationType t) {
-  using stellar::econ::StationType;
-  switch (t) {
-    case StationType::Outpost:      return "Outpost";
-    case StationType::Agricultural: return "Agricultural";
-    case StationType::Mining:       return "Mining";
-    case StationType::Refinery:     return "Refinery";
-    case StationType::Industrial:   return "Industrial";
-    case StationType::Research:     return "Research";
-    case StationType::TradeHub:     return "Trade Hub";
-    case StationType::Shipyard:     return "Shipyard";
-    default:                        return "Unknown";
-  }
-}
-
-static ImVec4 stationTypeColor(stellar::econ::StationType t) {
-  using stellar::econ::StationType;
-  switch (t) {
-    case StationType::Outpost:      return {0.7f, 0.7f, 0.7f, 1.0f};
-    case StationType::Agricultural: return {0.4f, 0.85f, 0.4f, 1.0f};
-    case StationType::Mining:       return {0.75f, 0.55f, 0.35f, 1.0f};
-    case StationType::Refinery:     return {0.8f, 0.7f, 0.2f, 1.0f};
-    case StationType::Industrial:   return {0.35f, 0.55f, 0.9f, 1.0f};
-    case StationType::Research:     return {0.7f, 0.35f, 0.9f, 1.0f};
-    case StationType::TradeHub:     return {0.9f, 0.65f, 0.2f, 1.0f};
-    case StationType::Shipyard:     return {0.95f, 0.35f, 0.35f, 1.0f};
-    default:                        return {1,1,1,1};
-  }
-}
-
-// ------------ Gameplay types ------------
-
-enum class NavTargetType : std::uint8_t {
-  None = 0,
-  Planet,
-  Station,
-  Npc,
-};
-
-struct NavTarget {
-  NavTargetType type{NavTargetType::None};
-  int planetIndex{-1};
-  stellar::sim::StationId stationId{0};
-  std::uint64_t npcId{0};
-};
-
-enum class NpcRole : std::uint8_t {
-  Trader = 0,
-  Pirate,
-  Police,
-};
-
-enum class NpcState : std::uint8_t {
-  Docked = 0,
-  Travelling,
-  Loiter,
-};
-
-struct NpcShip {
-  std::uint64_t id{0};
-  std::string name;
-  NpcRole role{NpcRole::Trader};
-
-  // Position is always in "normal space" km coordinates.
-  stellar::math::Vec3d posKm{0,0,0};
-
-  // Simple travel plan between stations (for traffic).
-  stellar::sim::StationId origin{0};
-  stellar::sim::StationId dest{0};
-  double travelT{0.0};
-  double travelDurationS{1.0};
-  stellar::math::Vec3d travelStart{0,0,0};
-  stellar::math::Vec3d travelEnd{0,0,0};
-
-  NpcState state{NpcState::Docked};
-  double stateTimerS{0.0};
-
-  // Trading payload
-  stellar::econ::CommodityId cargoCommodity{stellar::econ::CommodityId::Food};
-  double cargoUnits{0.0};
-};
-
-struct DockingClearance {
-  bool granted{false};
-  double expiresDay{0.0};
-};
-
-struct StationTraffic {
-  // A very small traffic gate: only one ship can be on final approach at a time.
-  double occupiedUntilDay{0.0};
-};
-
-enum class FlightMode : std::uint8_t {
-  Normal = 0,
-  Supercruise,
-  Hyperspace,
-  Docked,
-};
-
-struct InterdictionEvent {
-  bool active{false};
-  double timeLeftS{0.0};
-  double escapeMeter{0.0}; // 0..1
-  stellar::math::Vec3d escapeDir{0,0,1};
-  std::uint64_t pirateId{0};
-};
-
-struct Toast {
-  std::string text;
-  double timeLeftS{0.0};
-};
-
-static void pushToast(std::deque<Toast>& toasts, std::string text, double ttlS = 4.0) {
-  toasts.push_front(Toast{std::move(text), ttlS});
-  while (toasts.size() > 6) toasts.pop_back();
-}
-
-static double cargoMassKg(const std::array<double, stellar::econ::kCommodityCount>& cargo) {
-  double m = 0.0;
-  for (std::size_t i = 0; i < stellar::econ::kCommodityCount; ++i) {
-    const auto id = static_cast<stellar::econ::CommodityId>(i);
-    m += cargo[i] * stellar::econ::commodityDef(id).massKg;
-  }
-  return m;
-}
-
-static double cargoValueEstimate(const stellar::sim::StarSystem& sys,
-                                 stellar::sim::Universe& uni,
-                                 double timeDays,
-                                 const std::array<double, stellar::econ::kCommodityCount>& cargo) {
-  // Very rough estimate: use mid prices at the first station (if any) as a reference.
-  if (sys.stations.empty()) return 0.0;
-  const auto& st = sys.stations.front();
-  auto& econ = uni.stationEconomy(st, timeDays);
-
-  double v = 0.0;
-  for (std::size_t i = 0; i < stellar::econ::kCommodityCount; ++i) {
-    const auto id = static_cast<stellar::econ::CommodityId>(i);
-    if (cargo[i] <= 0.0) continue;
-    const double p = stellar::econ::midPrice(econ, st.economyModel, id);
-    v += cargo[i] * p;
-  }
-  return v;
-}
-
-static std::optional<const stellar::sim::Station*> findStationById(const stellar::sim::StarSystem& sys,
-                                                                   stellar::sim::StationId id) {
-  for (const auto& st : sys.stations) {
-    if (st.id == id) return &st;
-  }
-  return std::nullopt;
-}
-
-static std::optional<int> findPlanetIndexByName(const stellar::sim::StarSystem& sys, const std::string& name) {
-  for (int i = 0; i < static_cast<int>(sys.planets.size()); ++i) {
-    if (sys.planets[static_cast<std::size_t>(i)].name == name) return i;
-  }
-  return std::nullopt;
-}
-
-static const char* npcRoleName(NpcRole r) {
-  switch (r) {
-    case NpcRole::Trader: return "Trader";
-    case NpcRole::Pirate: return "Pirate";
-    case NpcRole::Police: return "Security";
-    default: return "Contact";
-  }
-}
-
-// Basic deterministic NPC name.
-static std::string makeNpcName(std::uint64_t seed, NpcRole role) {
-  stellar::proc::NameGenerator ng(seed);
-  std::string base = ng.systemName();
-  if (base.size() > 12) base.resize(12);
-  switch (role) {
-    case NpcRole::Trader: return "Hauler " + base;
-    case NpcRole::Pirate: return "Pirate " + base;
-    case NpcRole::Police: return "Sec " + base;
-    default: return base;
-  }
-}
-
-// ------------ Mission generation ------------
-
-static const char* missionTypeName(stellar::sim::MissionType t) {
-  using stellar::sim::MissionType;
-  switch (t) {
-    case MissionType::Courier: return "Courier";
-    case MissionType::Delivery: return "Delivery";
-    case MissionType::BountyScan: return "Bounty Scan";
-    default: return "Mission";
-  }
-}
-
-static std::vector<stellar::sim::Mission> generateMissionBoard(
-    const stellar::sim::SystemStub& hereStub,
-    const stellar::sim::StarSystem& hereSys,
-    const stellar::sim::Station& fromStation,
-    stellar::sim::Universe& uni,
-    double timeDays,
-    int count,
-    double maxRadiusLy) {
-
-  std::vector<stellar::sim::Mission> out;
-  out.reserve(static_cast<std::size_t>(count));
-
-  // Deterministic-ish seed: station id + day
-  const std::uint64_t dayKey = static_cast<std::uint64_t>(std::floor(timeDays));
-  stellar::core::SplitMix64 rng(stellar::core::hashCombine(static_cast<std::uint64_t>(fromStation.id), dayKey));
-
-  auto nearby = uni.queryNearby(hereStub.posLy, maxRadiusLy, 96);
-  if (nearby.empty()) return out;
-
-  // Helper: pick a random destination station (possibly in another system).
-  auto pickDestStation = [&]() -> std::optional<std::pair<stellar::sim::SystemStub, const stellar::sim::Station*>> {
-    for (int tries = 0; tries < 12; ++tries) {
-      const auto& dstStub = nearby[static_cast<std::size_t>(rng.rangeInt(0, static_cast<int>(nearby.size()) - 1))];
-      const auto& dstSys = uni.getSystem(dstStub.id, &dstStub);
-      if (dstSys.stations.empty()) continue;
-
-      const auto& dstStation = dstSys.stations[static_cast<std::size_t>(rng.rangeInt(0, static_cast<int>(dstSys.stations.size()) - 1))];
-      // Avoid "from -> same" loops.
-      if (dstStub.id == hereStub.id && dstStation.id == fromStation.id) continue;
-      return std::make_pair(dstStub, &dstStation);
-    }
-    return std::nullopt;
-  };
-
-  // Use current economy snapshot for availability weighting.
-  auto& fromEcon = uni.stationEconomy(fromStation, timeDays);
-
-  for (int i = 0; i < count; ++i) {
-    auto dst = pickDestStation();
-    if (!dst) break;
-
-    const auto& dstStub = dst->first;
-    const auto* dstStation = dst->second;
-    const double distLy = (dstStub.posLy - hereStub.posLy).length();
-
-    const double r = rng.nextDouble();
-    stellar::sim::Mission m{};
-    m.type = (r < 0.45) ? stellar::sim::MissionType::Courier
-         : (r < 0.85) ? stellar::sim::MissionType::Delivery
-                      : stellar::sim::MissionType::BountyScan;
-
-    m.fromSystem = hereStub.id;
-    m.fromStation = fromStation.id;
-    m.toSystem = dstStub.id;
-    m.toStation = dstStation->id;
-
-    // Deadline scales with distance.
-    m.deadlineDay = timeDays + std::max(1.0, distLy * 0.6) + rng.range(1.0, 6.0);
-
-    // Base reward scales with distance.
-    const double base = 120.0 + distLy * 22.0;
-
-    if (m.type == stellar::sim::MissionType::Courier) {
-      m.units = 0.0;
-      m.reward = base * rng.range(0.9, 1.25);
-      m.cargoProvided = false;
-    } else if (m.type == stellar::sim::MissionType::Delivery) {
-      // Choose a commodity the station actually has in stock.
-      // Prefer "surplus" goods (inventory above desiredStock).
-      int bestCid = -1;
-      double bestScore = -1e9;
-      for (std::size_t cid = 0; cid < stellar::econ::kCommodityCount; ++cid) {
-        const double inv = fromEcon.inventory[cid];
-        const double desired = fromStation.economyModel.desiredStock[cid];
-        if (inv < 8.0) continue;
-        const double surplus = inv - desired;
-        const double score = surplus + rng.range(-5.0, 5.0);
-        if (score > bestScore) {
-          bestScore = score;
-          bestCid = static_cast<int>(cid);
-        }
-      }
-
-      if (bestCid < 0) {
-        // Fallback: Food.
-        bestCid = static_cast<int>(stellar::econ::CommodityId::Food);
-      }
-      m.commodity = static_cast<stellar::econ::CommodityId>(bestCid);
-
-      // Units are limited by station stock, so scarcity matters.
-      const double inv = fromEcon.inventory[static_cast<std::size_t>(m.commodity)];
-      m.units = std::clamp(rng.range(6.0, 26.0), 4.0, std::max(4.0, inv * 0.25));
-      m.cargoProvided = true;
-
-      // Delivery is worth more than courier.
-      m.reward = (base + m.units * 6.0) * rng.range(1.0, 1.35);
+    if (docked) {
+      ImGui::Text("Docked at: %s", (st.id == dockedId) ? st.name.c_str() : "(other station)");
     } else {
-      // Bounty scan: spawn a "wanted" ship in the target system.
-      m.units = 0.0;
-      m.cargoProvided = false;
-      m.reward = (base + 180.0) * rng.range(1.0, 1.35);
-
-      // Target id will be filled when accepted.
-      m.targetNpcId = 0;
+      ImGui::TextDisabled("Not docked");
     }
-
-    out.push_back(std::move(m));
+  } else {
+    ImGui::Text("No stations in system.");
   }
 
-  return out;
+  ImGui::End();
+  return changed;
 }
 
-// ------------ Trading helper ------------
+struct ToastMsg {
+  std::string text;
+  double ttl{3.0}; // seconds remaining
+};
 
-static std::optional<std::pair<stellar::econ::CommodityId, double>> pickBestTrade(
-    stellar::sim::Universe& uni,
-    const stellar::sim::Station& origin,
-    const stellar::sim::Station& dest,
-    double timeDays,
-    double maxUnits) {
+static void toast(std::vector<ToastMsg>& toasts, std::string msg, double ttlSec=3.0) {
+  toasts.push_back({std::move(msg), ttlSec});
+}
 
-  auto& e0 = uni.stationEconomy(origin, timeDays);
-  auto& e1 = uni.stationEconomy(dest, timeDays);
+struct ClearanceState {
+  bool granted{false};
+  double expiresDays{0.0};
+  double cooldownUntilDays{0.0};
+};
 
-  double bestProfitPerUnit = 0.0;
-  stellar::econ::CommodityId bestId = stellar::econ::CommodityId::Food;
+enum class TargetKind : int { None=0, Station=1, Planet=2, Contact=3 };
 
-  for (std::size_t i = 0; i < stellar::econ::kCommodityCount; ++i) {
-    auto id = static_cast<stellar::econ::CommodityId>(i);
-    const auto q0 = stellar::econ::quote(e0, origin.economyModel, id);
-    const auto q1 = stellar::econ::quote(e1, dest.economyModel, id);
+struct Target {
+  TargetKind kind{TargetKind::None};
+  std::size_t index{0}; // station/planet/contact index
+};
 
-    if (q0.ask <= 0.0 || q1.bid <= 0.0) continue;
-    if (q0.inventory < 2.0) continue;
+struct Contact {
+  std::string name;
+  sim::Ship ship{};
+  bool pirate{false};
 
-    const double profit = q1.bid - q0.ask;
-    if (profit > bestProfitPerUnit) {
-      bestProfitPerUnit = profit;
-      bestId = id;
-    }
+  double shield{60.0};
+  double hull{70.0};
+
+  double fireCooldown{0.0}; // seconds
+  bool alive{true};
+};
+
+static void applyDamage(double dmg, double& shield, double& hull) {
+  if (shield > 0.0) {
+    const double s = std::min(shield, dmg);
+    shield -= s;
+    dmg -= s;
+  }
+  if (dmg > 0.0) {
+    hull -= dmg;
+  }
+}
+
+static void emitStationGeometry(const sim::Station& st,
+                                const math::Vec3d& stPosKm,
+                                const math::Quatd& stQ,
+                                std::vector<render::InstanceData>& outCubeInstances) {
+  // Render in render-units
+  const math::Vec3d posU = toRenderU(stPosKm);
+
+  // Station scale factor: exaggerate a bit so it's readable at prototype camera distances.
+  const double s = std::max(0.8, (st.radiusKm / kRENDER_UNIT_KM) * 1800.0);
+  const math::Vec3d baseScaleU = {s, s, s};
+
+  auto addPart = [&](const math::Vec3d& localPosU, const math::Vec3d& localScaleU, float r, float g, float b) {
+    const math::Vec3d worldPosU = posU + stQ.rotate(localPosU);
+    const math::Quatd worldQ = stQ;
+    outCubeInstances.push_back(makeInst(worldPosU, localScaleU, worldQ, r,g,b));
+  };
+
+  // Central body (elongated)
+  addPart({0,0,0}, {baseScaleU.x*0.9, baseScaleU.y*0.9, baseScaleU.z*1.3}, 0.65f,0.68f,0.72f);
+
+  // Ring (8 segments)
+  const double ringR = baseScaleU.x * 1.25;
+  const double segLen = baseScaleU.z * 0.55;
+  for (int i = 0; i < 8; ++i) {
+    const double ang = (double)i / 8.0 * 2.0 * math::kPi;
+    const double cx = std::cos(ang), sx = std::sin(ang);
+    const math::Vec3d lp{ ringR * cx, ringR * sx, 0.0 };
+    addPart(lp, {baseScaleU.x*0.22, baseScaleU.y*0.22, segLen}, 0.45f,0.55f,0.70f);
   }
 
-  if (bestProfitPerUnit <= 0.1) return std::nullopt;
+  // Docking "mail slot" frame on +Z face
+  const double frameZ = baseScaleU.z * 1.3;
+  const double frameW = baseScaleU.x * 1.15;
+  const double frameH = baseScaleU.y * 0.60;
+  const double thickness = baseScaleU.x * 0.12;
 
-  // Small-ish NPC loads to keep stations from being instantly drained.
-  auto& e0b = uni.stationEconomy(origin, timeDays);
-  const auto q0b = stellar::econ::quote(e0b, origin.economyModel, bestId);
-  const double units = std::clamp(maxUnits, 2.0, std::max(2.0, q0b.inventory * 0.18));
+  // Left/right pylons
+  addPart({-frameW*0.5, 0, frameZ}, {thickness, frameH, thickness}, 0.85f,0.80f,0.55f);
+  addPart({+frameW*0.5, 0, frameZ}, {thickness, frameH, thickness}, 0.85f,0.80f,0.55f);
 
-  return std::make_pair(bestId, units);
+  // Top/bottom bars
+  addPart({0, +frameH*0.5, frameZ}, {frameW, thickness, thickness}, 0.85f,0.80f,0.55f);
+  addPart({0, -frameH*0.5, frameZ}, {frameW, thickness, thickness}, 0.85f,0.80f,0.55f);
+
+  // A small "light strip" above slot
+  addPart({0, +frameH*0.65, frameZ}, {frameW*0.8, thickness*0.6, thickness*0.6}, 0.25f,0.85f,0.35f);
 }
 
-// ------------ Main ------------
+static bool insideStationHullExceptSlot(const sim::Station& st,
+                                       const math::Vec3d& relLocalKm) {
+  // Local station hull approximation: box (wx,wy,wz), with a rectangular slot tunnel cut out.
+  const double wx = st.radiusKm * 0.70;
+  const double wy = st.radiusKm * 0.70;
+  const double wz = st.radiusKm * 1.10;
 
-int main(int /*argc*/, char** /*argv*/) {
-  // SDL
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_EVENTS) != 0) {
-    std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+  const bool insideBox = (std::abs(relLocalKm.x) < wx) && (std::abs(relLocalKm.y) < wy) && (std::abs(relLocalKm.z) < wz);
+  if (!insideBox) return false;
+
+  // Slot tunnel cutout near +Z face (entrance at +wz)
+  const double slotHalfW = st.slotWidthKm * 0.5;
+  const double slotHalfH = st.slotHeightKm * 0.5;
+
+  const double zEntrance = wz;
+  const double zMin = zEntrance - st.slotDepthKm;
+
+  const bool insideTunnel =
+    (std::abs(relLocalKm.x) < slotHalfW) &&
+    (std::abs(relLocalKm.y) < slotHalfH) &&
+    (relLocalKm.z <= zEntrance) &&
+    (relLocalKm.z >= zMin);
+
+  return !insideTunnel;
+}
+
+static bool dockingSlotConditions(const sim::Station& st,
+                                 const math::Vec3d& relLocalKm,
+                                 const math::Vec3d& shipVelRelLocalKmS,
+                                 const math::Vec3d& shipForwardLocal,
+                                 const math::Vec3d& shipUpLocal,
+                                 bool clearanceGranted) {
+  if (!clearanceGranted) return false;
+
+  const double wx = st.radiusKm * 0.70;
+  const double wy = st.radiusKm * 0.70;
+  const double wz = st.radiusKm * 1.10;
+  const double zEntrance = wz;
+  const double zMin = zEntrance - st.slotDepthKm;
+
+  // Must be inside tunnel volume (i.e. have flown into the mail-slot)
+  const double slotHalfW = st.slotWidthKm * 0.5;
+  const double slotHalfH = st.slotHeightKm * 0.5;
+
+  const bool insideTunnel =
+    (std::abs(relLocalKm.x) < slotHalfW) &&
+    (std::abs(relLocalKm.y) < slotHalfH) &&
+    (relLocalKm.z <= zEntrance - 0.05 * st.radiusKm) &&
+    (relLocalKm.z >= zMin + 0.10 * st.radiusKm);
+
+  if (!insideTunnel) return false;
+
+  const double relSpeed = shipVelRelLocalKmS.length();
+  if (relSpeed > st.maxApproachSpeedKmS) return false;
+
+  // Orientation: ship forward should point into the station (-Z local),
+  // and ship up should be roughly +Y local (roll alignment).
+  const double fwdAlign = math::dot(shipForwardLocal.normalized(), math::Vec3d{0,0,-1});
+  const double upAlign = math::dot(shipUpLocal.normalized(), math::Vec3d{0,1,0});
+  return (fwdAlign > 0.92 && upAlign > 0.70);
+}
+
+int main(int argc, char** argv) {
+  (void)argc; (void)argv;
+
+  core::setLogLevel(core::LogLevel::Info);
+
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0) {
+    core::log(core::LogLevel::Error, std::string("SDL_Init failed: ") + SDL_GetError());
     return 1;
   }
 
+  // GL 3.3 core
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -484,1844 +380,1199 @@ int main(int /*argc*/, char** /*argv*/) {
   SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
   SDL_Window* window = SDL_CreateWindow(
-    "Stellar Forge (Early Playable)",
-    SDL_WINDOWPOS_CENTERED,
-    SDL_WINDOWPOS_CENTERED,
-    1280,
-    720,
-    SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE
-  );
+      "Stellar Forge (prototype)",
+      SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+      1280, 720,
+      SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+
   if (!window) {
-    std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
-    SDL_Quit();
+    core::log(core::LogLevel::Error, std::string("SDL_CreateWindow failed: ") + SDL_GetError());
     return 1;
   }
 
-  SDL_GLContext gl_ctx = SDL_GL_CreateContext(window);
-  SDL_GL_MakeCurrent(window, gl_ctx);
+  SDL_GLContext glContext = SDL_GL_CreateContext(window);
+  SDL_GL_MakeCurrent(window, glContext);
   SDL_GL_SetSwapInterval(1);
 
-  if (!stellar::render::gl::init()) {
-    std::fprintf(stderr, "Failed to load OpenGL functions.\n");
-    SDL_DestroyWindow(window);
-    SDL_Quit();
+  if (!render::gl::load()) {
+    core::log(core::LogLevel::Error, "Failed to load OpenGL functions.");
     return 1;
   }
 
-  // ImGui
+  core::log(core::LogLevel::Info, std::string("OpenGL: ") + render::gl::glVersionString());
+
+  glEnable(GL_DEPTH_TEST);
+
+  // --- ImGui setup ---
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   ImGuiIO& io = ImGui::GetIO();
-  (void)io;
+  io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
   ImGui::StyleColorsDark();
 
-  ImGui_ImplSDL2_InitForOpenGL(window, gl_ctx);
-  ImGui_ImplOpenGL3_Init("#version 330");
+  ImGui_ImplSDL2_InitForOpenGL(window, glContext);
+  ImGui_ImplOpenGL3_Init("#version 330 core");
 
-  // Renderers
+  // --- Render assets ---
+  render::Mesh sphere = render::Mesh::makeUvSphere(48, 24);
+  render::Mesh cube   = render::Mesh::makeCube();
+
+  render::Texture2D checker;
+  checker.createChecker(256, 256, 16);
+
+  render::MeshRenderer meshRenderer;
   std::string err;
-  stellar::render::MeshRenderer meshRenderer;
-  stellar::render::LineRenderer lineRenderer;
-  stellar::render::PointRenderer pointRenderer;
+  if (!meshRenderer.init(&err)) {
+    core::log(core::LogLevel::Error, err);
+    return 1;
+  }
+  meshRenderer.setTexture(&checker);
 
-  if (!meshRenderer.init(&err) || !lineRenderer.init(&err) || !pointRenderer.init(&err)) {
-    std::fprintf(stderr, "Renderer init failed: %s\n", err.c_str());
-    SDL_DestroyWindow(window);
-    SDL_Quit();
+  render::LineRenderer lineRenderer;
+  if (!lineRenderer.init(&err)) {
+    core::log(core::LogLevel::Error, err);
     return 1;
   }
 
-  stellar::render::Mesh cube = stellar::render::Mesh::makeCube();
-  stellar::render::Mesh sphere = stellar::render::Mesh::makeUvSphere(32, 16);
-  stellar::render::Texture2D checker = makeCheckerTexture(64, 64);
+  // --- Universe / sim state ---
+  core::u64 seed = 1337;
+  sim::Universe universe(seed);
 
-  meshRenderer.setTexture(&checker);
-
-  // Game state
-  constexpr const char* kSavePath = "savegame.txt";
-  stellar::sim::SaveGame save{};
-  (void)stellar::sim::loadFromFile(kSavePath, save);
-
-  // Universe
-  if (save.seed == 0) save.seed = 1337;
-  stellar::sim::Universe universe(save.seed);
-  if (!save.stationOverrides.empty()) universe.importStationOverrides(save.stationOverrides);
-
-  // Choose a system if missing.
-  std::vector<stellar::sim::SystemStub> nearby;
-  if (save.currentSystem == 0) {
-    nearby = universe.queryNearby({0, 0, 0}, 45.0, 64);
-    if (nearby.empty()) {
-      std::fprintf(stderr, "No systems generated.\n");
-      SDL_DestroyWindow(window);
-      SDL_Quit();
-      return 1;
-    }
-    save.currentSystem = nearby.front().id;
+  sim::SystemStub currentStub{};
+  if (auto s = universe.findClosestSystem({0,0,0}, 80.0)) {
+    currentStub = *s;
+  } else {
+    // Should be rare; fall back
+    currentStub = sim::SystemStub{};
+    currentStub.id = 0;
+    currentStub.seed = seed;
+    currentStub.name = "Origin";
+    currentStub.posLy = {0,0,0};
+    currentStub.planetCount = 6;
+    currentStub.stationCount = 1;
   }
 
-  // Keep a cached stub for current system (for mission board + galaxy map distance).
-  // If it isn't in the current nearby list, try to find it.
-  if (nearby.empty()) {
-    nearby = universe.queryNearby({0, 0, 0}, 80.0, 256);
-  }
-  auto findStub = [&](stellar::sim::SystemId id) -> std::optional<stellar::sim::SystemStub> {
-    for (const auto& s : nearby) if (s.id == id) return s;
-    // Fallback: search around the origin; this is cheap enough for now.
-    auto more = universe.queryNearby({0, 0, 0}, 200.0, 512);
-    for (const auto& s : more) if (s.id == id) return s;
-    return std::nullopt;
-  };
+  const sim::StarSystem* currentSystem = &universe.getSystem(currentStub.id, &currentStub);
 
-  std::optional<stellar::sim::SystemStub> currentStubOpt = findStub(save.currentSystem);
-  stellar::sim::SystemStub currentStub = currentStubOpt.value_or(stellar::sim::SystemStub{});
+  sim::Ship ship;
+  ship.setMaxLinearAccelKmS2(0.08);
+  ship.setMaxAngularAccelRadS2(1.2);
 
-  const stellar::sim::StarSystem* currentSys = &universe.getSystem(save.currentSystem, currentStubOpt ? &currentStub : nullptr);
+  // Player combat state
+  double playerShield = 100.0;
+  double playerHull = 100.0;
+  double playerLaserCooldown = 0.0; // seconds
 
-  // Player ship
-  stellar::sim::Ship ship;
-  ship.setPositionKm(save.shipPosKm);
-  ship.setVelocityKmS(save.shipVelKmS);
-  ship.setOrientation(save.shipOrient);
-  ship.setAngularVelocityRadS(save.shipAngVelRadS);
+  // Time
+  double timeDays = 0.0;
+  double timeScale = 60.0; // simulated seconds per real second
+  bool paused = false;
 
-  // If no meaningful saved position, spawn near first station.
-  if (ship.positionKm().length() < 1e-6 && !currentSys->stations.empty()) {
-    const auto& st = currentSys->stations.front();
-    const auto p = stationPosKm(st, save.timeDays);
-    const auto axis = p.normalized();
-    ship.setPositionKm(p + axis * (st.docking.corridorLengthKm * 0.85));
-    ship.setVelocityKmS(orbitVelKmS(st.orbit, save.timeDays));
-    ship.setOrientation(stellar::math::Quatd::fromAxisAngle({0, 1, 0}, 0));
-  }
+  // Economy
+  double credits = 2500.0;
+  std::array<double, econ::kCommodityCount> cargo{};
+  int selectedStationIndex = 0;
 
-  // Core gameplay
-  FlightMode mode = (save.dockedStation != 0) ? FlightMode::Docked : FlightMode::Normal;
-  NavTarget navTarget{};
-  bool autopilot = false;
-  bool dampers = true;
+  // Docking state
+  bool docked = false;
+  sim::StationId dockedStationId = 0;
+  std::unordered_map<sim::StationId, ClearanceState> clearances;
 
-  // Time acceleration: Pioneer-style levels.
-  std::array<double, 5> timeWarpLevels{1.0, 10.0, 100.0, 1000.0, 10000.0};
-  int timeWarpIndex = 0;
+  // Contacts (pirates etc.)
+  std::vector<Contact> contacts;
+  core::SplitMix64 rng(seed ^ 0xC0FFEEu);
+  double nextPirateSpawnDays = 0.01; // soon after start
 
-  // Supercruise
-  double scThrottle = 0.0;         // 0..1
-  bool scAssist = true;            // 7-second rule assist
-  double scSpeedKmS = 0.0;
-  double scMaxSpeedKmS = 220000.0; // ~0.73c (game scale)
+  // Beams (for laser visuals)
+  struct Beam { math::Vec3d aU, bU; float r,g,b; double ttl; };
+  std::vector<Beam> beams;
 
-  // FSD hyperspace
-  double fuel = save.fuel;
-  double fuelMax = save.fuelMax;
-  double hull = save.hull;
-  double cargoCapacityKg = save.cargoCapacityKg;
-  double fsdReadyDay = save.fsdReadyDay;
+  // Save/load
+  const std::string savePath = "savegame.txt";
 
-  // Thermal
-  bool scoopEnabled = true;
-  double heat = 0.0; // 0..1+
-
-  // Docking
-  stellar::sim::StationId dockedStationId = save.dockedStation;
-  std::unordered_map<stellar::sim::StationId, DockingClearance> clearance{};
-  std::unordered_map<stellar::sim::StationId, StationTraffic> stationTraffic{};
-
-  // Missions
-  std::vector<stellar::sim::Mission> activeMissions = save.missions;
-  std::uint64_t nextMissionId = save.nextMissionId;
-
-  // Mission board cache
-  stellar::sim::StationId boardStationId = 0;
-  std::uint64_t boardDayKey = 0;
-  std::vector<stellar::sim::Mission> boardMissions;
-
-  // NPCs
-  std::vector<NpcShip> npcs;
-
-  auto regenNpcsForSystem = [&](const stellar::sim::StarSystem& sys, const stellar::sim::SystemStub& stub) {
-    npcs.clear();
-    stationTraffic.clear();
-    clearance.clear();
-
-    // Pre-create traffic state for stations.
-    for (const auto& st : sys.stations) {
-      stationTraffic[st.id] = StationTraffic{};
-      clearance[st.id] = DockingClearance{};
-    }
-
-    stellar::core::SplitMix64 rng(stellar::core::hashCombine(static_cast<std::uint64_t>(stub.seed), 0xC0FFEEULL));
-
-    const int trafficCount = std::clamp(static_cast<int>(sys.stations.size()) * 3, 5, 18);
-    const int pirateCount = std::clamp(static_cast<int>(sys.stations.size()) / 2, 1, 4);
-    const int policeCount = std::clamp(static_cast<int>(sys.stations.size()) / 3, 0, 2);
-
-    auto pickStation = [&]() -> std::optional<const stellar::sim::Station*> {
-      if (sys.stations.empty()) return std::nullopt;
-      return &sys.stations[static_cast<std::size_t>(rng.rangeInt(0, static_cast<int>(sys.stations.size()) - 1))];
-    };
-
-    auto makeNpc = [&](NpcRole role) {
-      NpcShip n{};
-      n.id = stellar::core::hashCombine(static_cast<std::uint64_t>(stub.id), rng.nextU64());
-      n.role = role;
-      n.name = makeNpcName(stellar::core::hashCombine(static_cast<std::uint64_t>(n.id), 0xABCDEFULL), role);
-
-      auto st0 = pickStation();
-      auto st1 = pickStation();
-      if (st0 && st1) {
-        n.origin = (*st0)->id;
-        n.dest = (*st1)->id;
-        if (n.dest == n.origin && sys.stations.size() > 1) {
-          n.dest = sys.stations[(static_cast<std::size_t>(rng.rangeInt(0, static_cast<int>(sys.stations.size()) - 1)) + 1) % sys.stations.size()].id;
-        }
-      }
-
-      n.state = NpcState::Docked;
-      n.stateTimerS = rng.range(2.0, 20.0);
-      n.posKm = {0, 0, 0};
-
-      npcs.push_back(std::move(n));
-    };
-
-    for (int i = 0; i < trafficCount; ++i) makeNpc(NpcRole::Trader);
-    for (int i = 0; i < pirateCount; ++i) makeNpc(NpcRole::Pirate);
-    for (int i = 0; i < policeCount; ++i) makeNpc(NpcRole::Police);
-
-    // Place non-traders in loose orbits around the star.
-    for (auto& n : npcs) {
-      if (n.role == NpcRole::Trader) continue;
-      const double rAU = rng.range(0.15, 1.8);
-      const double ang = rng.range(0.0, 2.0 * stellar::math::kPi);
-      n.posKm = {std::cos(ang) * auToKm(rAU), rng.range(-0.02, 0.02) * auToKm(rAU), std::sin(ang) * auToKm(rAU)};
-      n.state = NpcState::Loiter;
-      n.stateTimerS = rng.range(10.0, 45.0);
-    }
-  };
-
-  regenNpcsForSystem(*currentSys, currentStub);
-
-  // Interdiction
-  InterdictionEvent interdiction{};
-
-  // Toasts
-  std::deque<Toast> toasts;
-
-  // UI toggles
-  bool showHelp = true;
-  bool showNav = true;
-  bool showMarket = true;
+  // UI state
   bool showGalaxy = true;
-  bool showMissions = true;
+  bool showShip = true;
+  bool showEconomy = true;
+  bool showContacts = true;
 
-  // Remember last selected system in galaxy map.
-  stellar::sim::SystemId galaxySelectedSystem = 0;
+  // Flight assistance
+  bool autopilot = false;
 
-  // Random for moment-to-moment events
-  stellar::core::SplitMix64 sessionRng(stellar::core::hashCombine(save.seed, 0x12345678ULL));
+  // Target
+  Target target{};
 
-  // Render camera
-  stellar::render::Camera cam;
-  cam.setPerspective(stellar::math::degToRad(70.0), 1280.0 / 720.0, 0.01, 25000.0);
+  std::vector<ToastMsg> toasts;
 
-  // Main loop
+  auto respawnNearStation = [&](const sim::StarSystem& sys, std::size_t stationIdx) {
+    if (sys.stations.empty()) {
+      ship.setPositionKm({0,0,-8000.0});
+      ship.setVelocityKmS({0,0,0});
+      ship.setAngularVelocityRadS({0,0,0});
+      ship.setOrientation(math::Quatd::identity());
+      return;
+    }
+    stationIdx = std::min(stationIdx, sys.stations.size() - 1);
+    const auto& st = sys.stations[stationIdx];
+
+    const math::Vec3d stPos = stationPosKm(st, timeDays);
+    const math::Quatd stQ = stationOrient(st, stPos, timeDays);
+    const math::Vec3d axis = stQ.rotate({0,0,1}); // outward
+    const double startDistKm = st.radiusKm * 14.0;
+    ship.setPositionKm(stPos + axis * startDistKm);
+    ship.setVelocityKmS(stationVelKmS(st, timeDays));
+    ship.setAngularVelocityRadS({0,0,0});
+    // face toward the slot (into station)
+    ship.setOrientation(quatFromTo({0,0,1}, -axis));
+  };
+
+  // Spawn near first station for immediate gameplay.
+  respawnNearStation(*currentSystem, 0);
+
   bool running = true;
-  std::uint64_t lastTicks = SDL_GetPerformanceCounter();
+  auto last = std::chrono::high_resolution_clock::now();
 
-  auto isDocked = [&]() { return mode == FlightMode::Docked && dockedStationId != 0; };
-
-  auto setMode = [&](FlightMode m) {
-    // Don't stack time-warp with other flight modes.
-    if (m != FlightMode::Normal) {
-      timeWarpIndex = 0;
-    }
-
-    mode = m;
-    if (mode == FlightMode::Docked) {
-      scSpeedKmS = 0.0;
-      scThrottle = 0.0;
-      autopilot = false;
-      interdiction.active = false;
-    }
-  };
-
-  auto currentSystemName = [&]() -> std::string {
-    return currentSys ? currentSys->stub.name : std::string("?");
-  };
-
-  auto canTimeWarp = [&]() {
-    if (mode != FlightMode::Normal) return false;
-
-    if (autopilot) return false;
-
-    // If player is thrusting hard, don't allow time accel.
-    // (We apply time accel to physics; this avoids accidental slingshots.)
-    const auto v = ship.velocityKmS();
-    const double speed = v.length();
-    (void)speed;
-
-    // Must be reasonably far from stations & planets.
-    for (const auto& st : currentSys->stations) {
-      const auto p = stationPosKm(st, save.timeDays);
-      if ((p - ship.positionKm()).length() < 2000.0) return false;
-    }
-
-    for (const auto& pl : currentSys->planets) {
-      const auto p = planetPosKm(pl, save.timeDays);
-      if ((p - ship.positionKm()).length() < 8000.0) return false;
-    }
-    return true;
-  };
-
-  auto clearTargetIfInvalid = [&]() {
-    if (navTarget.type == NavTargetType::Station) {
-      auto st = findStationById(*currentSys, navTarget.stationId);
-      if (!st) navTarget = NavTarget{};
-    } else if (navTarget.type == NavTargetType::Planet) {
-      if (navTarget.planetIndex < 0 || navTarget.planetIndex >= static_cast<int>(currentSys->planets.size())) navTarget = NavTarget{};
-    } else if (navTarget.type == NavTargetType::Npc) {
-      const bool exists = std::any_of(npcs.begin(), npcs.end(), [&](const NpcShip& n) { return n.id == navTarget.npcId; });
-      if (!exists) navTarget = NavTarget{};
-    }
-  };
-
-  auto targetWorldPosKm = [&]() -> std::optional<stellar::math::Vec3d> {
-    clearTargetIfInvalid();
-    if (navTarget.type == NavTargetType::Station) {
-      auto st = findStationById(*currentSys, navTarget.stationId);
-      if (!st) return std::nullopt;
-      return stationPosKm(**st, save.timeDays);
-    }
-    if (navTarget.type == NavTargetType::Planet) {
-      if (navTarget.planetIndex < 0 || navTarget.planetIndex >= static_cast<int>(currentSys->planets.size())) return std::nullopt;
-      return planetPosKm(currentSys->planets[static_cast<std::size_t>(navTarget.planetIndex)], save.timeDays);
-    }
-    if (navTarget.type == NavTargetType::Npc) {
-      for (const auto& n : npcs) {
-        if (n.id == navTarget.npcId) return n.posKm;
-      }
-      return std::nullopt;
-    }
-    return std::nullopt;
-  };
-
-  auto targetName = [&]() -> std::string {
-    clearTargetIfInvalid();
-    if (navTarget.type == NavTargetType::Station) {
-      auto st = findStationById(*currentSys, navTarget.stationId);
-      if (!st) return "(none)";
-      return std::string("[Station] ") + (*st)->name;
-    }
-    if (navTarget.type == NavTargetType::Planet) {
-      if (navTarget.planetIndex < 0 || navTarget.planetIndex >= static_cast<int>(currentSys->planets.size())) return "(none)";
-      return std::string("[Planet] ") + currentSys->planets[static_cast<std::size_t>(navTarget.planetIndex)].name;
-    }
-    if (navTarget.type == NavTargetType::Npc) {
-      for (const auto& n : npcs) if (n.id == navTarget.npcId) return std::string("[Contact] ") + n.name;
-      return "(none)";
-    }
-    return "(none)";
-  };
-
-  auto tryDock = [&](const stellar::sim::Station& st) {
-    const auto stPos = stationPosKm(st, save.timeDays);
-    const auto stVel = orbitVelKmS(st.orbit, save.timeDays);
-
-    const auto axis = stPos.normalized();
-    const auto inbound = axis * -1.0;
-
-    const auto r = ship.positionKm() - stPos;
-    const double dist = r.length();
-
-    // Within physical docking radius.
-    if (dist > st.docking.radiusKm + 2.0) return false;
-
-    // Must have clearance.
-    auto& cl = clearance[st.id];
-    if (!cl.granted || save.timeDays > cl.expiresDay) {
-      return false;
-    }
-
-    // Must be slow.
-    const double relSpeed = (ship.velocityKmS() - stVel).length();
-    if (relSpeed > 0.03) return false;
-
-    // Must be aligned.
-    const double align = stellar::math::dot(ship.forward(), inbound);
-    if (align < st.docking.alignCos) return false;
-
-    dockedStationId = st.id;
-    save.dockedStation = st.id;
-    setMode(FlightMode::Docked);
-
-    // Snap to a "docking port" point.
-    ship.setPositionKm(stPos + axis * (st.docking.radiusKm + 1.0));
-    ship.setVelocityKmS(stVel);
-
-    pushToast(toasts, "Docked at " + st.name);
-    return true;
-  };
-
-  auto requestDocking = [&](const stellar::sim::Station& st) {
-    auto& traf = stationTraffic[st.id];
-    auto& cl = clearance[st.id];
-
-    const auto stPos = stationPosKm(st, save.timeDays);
-    const double dist = (stPos - ship.positionKm()).length();
-    if (dist > st.docking.commsRangeKm) {
-      pushToast(toasts, "Out of comms range.");
-      return;
-    }
-
-    // If currently occupied by another ship, deny.
-    if (save.timeDays < traf.occupiedUntilDay) {
-      pushToast(toasts, "Docking denied: traffic." );
-      return;
-    }
-
-    traf.occupiedUntilDay = save.timeDays + (90.0 / 86400.0); // reserve ~90 seconds
-    cl.granted = true;
-    cl.expiresDay = save.timeDays + (6.0 / 1440.0); // 6 minutes
-
-    pushToast(toasts, "Docking clearance granted.");
-  };
-
-  auto undock = [&]() {
-    if (!isDocked()) return;
-
-    auto stOpt = findStationById(*currentSys, dockedStationId);
-    if (!stOpt) {
-      dockedStationId = 0;
-      save.dockedStation = 0;
-      setMode(FlightMode::Normal);
-      return;
-    }
-
-    const auto& st = **stOpt;
-    const auto stPos = stationPosKm(st, save.timeDays);
-    const auto stVel = orbitVelKmS(st.orbit, save.timeDays);
-    const auto axis = stPos.normalized();
-
-    ship.setPositionKm(stPos + axis * (st.docking.corridorLengthKm * 0.9));
-    ship.setVelocityKmS(stVel);
-
-    dockedStationId = 0;
-    save.dockedStation = 0;
-    setMode(FlightMode::Normal);
-
-    pushToast(toasts, "Undocked.");
-  };
-
-  auto dropFromSupercruise = [&](bool hardDrop) {
-    if (mode != FlightMode::Supercruise) return;
-
-    // Convert supercruise speed to a smaller "normal" velocity.
-    const double dropSpeed = std::min(6.0, std::max(0.0, scSpeedKmS * 0.00005));
-    ship.setVelocityKmS(ship.forward() * dropSpeed);
-
-    scThrottle = 0.0;
-    scSpeedKmS = 0.0;
-    setMode(FlightMode::Normal);
-
-    if (hardDrop) {
-      // Minor hull damage.
-      hull = std::max(0.0, hull - 0.04);
-      pushToast(toasts, "Emergency drop! Hull stressed.");
-    } else {
-      pushToast(toasts, "Dropped to normal space.");
-    }
-  };
-
-  auto engageSupercruise = [&]() {
-    if (mode != FlightMode::Normal) return;
-    if (isDocked()) return;
-
-    // Don't allow supercruise too close to a station.
-    for (const auto& st : currentSys->stations) {
-      const auto p = stationPosKm(st, save.timeDays);
-      if ((p - ship.positionKm()).length() < 2000.0) {
-        pushToast(toasts, "Too close to station to engage supercruise.");
-        return;
-      }
-    }
-
-    setMode(FlightMode::Supercruise);
-    scThrottle = std::max(scThrottle, 0.1);
-    pushToast(toasts, "Supercruise engaged.");
-  };
-
-  auto jumpFuelPerLy = [&]() {
-    // Base cost per ly, scaled a bit by cargo mass.
-    const double base = 1.0;
-    const double massFactor = 1.0 + cargoMassKg(save.cargo) / std::max(1.0, cargoCapacityKg) * 0.35;
-    return base * massFactor;
-  };
-
-  auto maxJumpRangeLy = [&]() {
-    return (fuel <= 0.0) ? 0.0 : fuel / std::max(1e-6, jumpFuelPerLy());
-  };
-
-  auto arriveInSystemNearStation = [&](stellar::sim::SystemId sysId, const stellar::sim::SystemStub& stub) {
-    currentStub = stub;
-    currentSys = &universe.getSystem(sysId, &currentStub);
-    save.currentSystem = sysId;
-
-    regenNpcsForSystem(*currentSys, currentStub);
-
-    // Put the player near the first station (or at origin if none).
-    if (!currentSys->stations.empty()) {
-      const auto& st = currentSys->stations.front();
-      const auto p = stationPosKm(st, save.timeDays);
-      const auto axis = p.normalized();
-      ship.setPositionKm(p + axis * (st.docking.corridorLengthKm * 0.95));
-      ship.setVelocityKmS(orbitVelKmS(st.orbit, save.timeDays));
-      ship.setAngularVelocityRadS({0, 0, 0});
-    } else {
-      ship.setPositionKm({0, 0, auToKm(0.2)});
-      ship.setVelocityKmS({0, 0, 0});
-    }
-
-    dockedStationId = 0;
-    save.dockedStation = 0;
-    setMode(FlightMode::Normal);
-
-    pushToast(toasts, "Arrived in " + currentSystemName());
-  };
+  SDL_SetRelativeMouseMode(SDL_FALSE);
 
   while (running) {
-    // dt
-    std::uint64_t nowTicks = SDL_GetPerformanceCounter();
-    const double dt = static_cast<double>(nowTicks - lastTicks) / static_cast<double>(SDL_GetPerformanceFrequency());
-    lastTicks = nowTicks;
+    // Timing
+    auto now = std::chrono::high_resolution_clock::now();
+    const double dtReal = std::chrono::duration<double>(now - last).count();
+    last = now;
 
     // Events
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
-      ImGui_ImplSDL2_ProcessEvent(&e);
-      if (e.type == SDL_QUIT) running = false;
-      if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE) running = false;
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+      ImGui_ImplSDL2_ProcessEvent(&event);
 
-      if (e.type == SDL_KEYDOWN && !e.key.repeat) {
-        const SDL_Keycode key = e.key.keysym.sym;
-        if (key == SDLK_ESCAPE) running = false;
+      if (event.type == SDL_QUIT) running = false;
+      if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE) running = false;
 
-        // UI toggles
-        if (key == SDLK_F1) showHelp = !showHelp;
-        if (key == SDLK_F2) showNav = !showNav;
-        if (key == SDLK_F3) showMarket = !showMarket;
-        if (key == SDLK_F4) showGalaxy = !showGalaxy;
-        if (key == SDLK_F5) showMissions = !showMissions;
+      if (event.type == SDL_KEYDOWN && !event.key.repeat) {
+        if (event.key.keysym.sym == SDLK_ESCAPE) running = false;
 
-        // Flight assist
-        if (key == SDLK_f) {
-          dampers = !dampers;
-          pushToast(toasts, dampers ? "Flight assist: ON" : "Flight assist: OFF");
+        if (event.key.keysym.sym == SDLK_F5) {
+          sim::SaveGame s{};
+          s.seed = universe.seed();
+          s.timeDays = timeDays;
+          s.currentSystem = currentSystem->stub.id;
+          s.dockedStation = docked ? dockedStationId : 0;
+
+          s.shipPosKm = ship.positionKm();
+          s.shipVelKmS = ship.velocityKmS();
+          s.shipOrient = ship.orientation();
+          s.shipAngVelRadS = ship.angularVelocityRadS();
+
+          s.credits = credits;
+          s.cargo = cargo;
+          s.stationOverrides = universe.exportStationOverrides();
+
+          if (sim::saveToFile(s, savePath)) {
+            toast(toasts, "Saved to " + savePath, 2.5);
+          }
         }
 
-        // Time warp levels (1..5)
-        if (key >= SDLK_1 && key <= SDLK_5) {
-          const int idx = static_cast<int>(key - SDLK_1);
-          if (idx >= 0 && idx < static_cast<int>(timeWarpLevels.size())) {
-            if (idx == 0 || canTimeWarp()) {
-              timeWarpIndex = idx;
-              pushToast(toasts, "Time accel: x" + std::to_string(static_cast<int>(timeWarpLevels[static_cast<std::size_t>(timeWarpIndex)])));
+        if (event.key.keysym.sym == SDLK_F9) {
+          sim::SaveGame s{};
+          if (sim::loadFromFile(savePath, s)) {
+            universe = sim::Universe(s.seed);
+            universe.importStationOverrides(s.stationOverrides);
+
+            timeDays = s.timeDays;
+
+            const sim::StarSystem& sys = universe.getSystem(s.currentSystem);
+            currentStub = sys.stub;
+            currentSystem = &sys;
+
+            ship.setPositionKm(s.shipPosKm);
+            ship.setVelocityKmS(s.shipVelKmS);
+            ship.setOrientation(s.shipOrient);
+            ship.setAngularVelocityRadS(s.shipAngVelRadS);
+
+            credits = s.credits;
+            cargo = s.cargo;
+
+            docked = (s.dockedStation != 0);
+            dockedStationId = s.dockedStation;
+            selectedStationIndex = 0;
+            if (docked) {
+              for (std::size_t i = 0; i < sys.stations.size(); ++i) {
+                if (sys.stations[i].id == s.dockedStation) selectedStationIndex = (int)i;
+              }
+            }
+
+            // clear transient runtime things
+            contacts.clear();
+            beams.clear();
+            autopilot = false;
+
+            toast(toasts, "Loaded " + savePath, 2.5);
+          }
+        }
+
+        if (event.key.keysym.sym == SDLK_TAB) showGalaxy = !showGalaxy;
+        if (event.key.keysym.sym == SDLK_F1) showShip = !showShip;
+        if (event.key.keysym.sym == SDLK_F2) showEconomy = !showEconomy;
+        if (event.key.keysym.sym == SDLK_F3) showContacts = !showContacts;
+
+        if (event.key.keysym.sym == SDLK_SPACE) paused = !paused;
+
+        if (event.key.keysym.sym == SDLK_p) autopilot = !autopilot;
+        if (event.key.keysym.sym == SDLK_t) {
+          // cycle station targets
+          if (!currentSystem->stations.empty()) {
+            if (target.kind != TargetKind::Station) {
+              target.kind = TargetKind::Station;
+              target.index = 0;
             } else {
-              timeWarpIndex = 0;
-              pushToast(toasts, "Time accel unavailable (not safe).");
+              target.index = (target.index + 1) % currentSystem->stations.size();
             }
           }
         }
+        if (event.key.keysym.sym == SDLK_y) target = Target{};
 
-        // Docking
-        if (key == SDLK_l) {
-          // Request docking at target station, or nearest station.
-          const stellar::sim::Station* st = nullptr;
-          if (navTarget.type == NavTargetType::Station) {
-            auto s = findStationById(*currentSys, navTarget.stationId);
-            if (s) st = *s;
-          }
-          if (!st) {
-            // nearest
-            double best = std::numeric_limits<double>::max();
-            for (const auto& cand : currentSys->stations) {
-              const double d = (stationPosKm(cand, save.timeDays) - ship.positionKm()).length();
-              if (d < best) {
-                best = d;
-                st = &cand;
+        if (event.key.keysym.sym == SDLK_l) {
+          // Request docking clearance from targeted station
+          if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+            const auto& st = currentSystem->stations[target.index];
+            const math::Vec3d stPos = stationPosKm(st, timeDays);
+            const double dist = (ship.positionKm() - stPos).length();
+
+            auto& cs = clearances[st.id];
+
+            if (dist > st.commsRangeKm) {
+              toast(toasts, "Out of comms range for clearance.", 2.5);
+            } else if (timeDays < cs.cooldownUntilDays) {
+              toast(toasts, "Clearance channel busy. Try again soon.", 2.5);
+            } else {
+              // Simple logic: usually granted; sometimes denied (simulate traffic / capacity).
+              const double pGrant = 0.82;
+              cs.granted = rng.chance(pGrant);
+              if (cs.granted) {
+                cs.expiresDays = timeDays + (12.0 * 60.0) / 86400.0; // 12 minutes
+                toast(toasts, "Docking clearance GRANTED.", 3.0);
+              } else {
+                cs.cooldownUntilDays = timeDays + (90.0) / 86400.0; // 90 seconds
+                toast(toasts, "Docking clearance DENIED. (traffic)", 3.0);
               }
             }
-          }
-          if (st) requestDocking(*st);
-        }
-
-        if (key == SDLK_u) {
-          undock();
-        }
-
-        // Autopilot
-        if (key == SDLK_p) {
-          autopilot = !autopilot;
-          if (autopilot) {
-            timeWarpIndex = 0;
-          }
-          pushToast(toasts, autopilot ? "Autopilot: ON" : "Autopilot: OFF");
-        }
-
-        // Supercruise
-        if (key == SDLK_b) {
-          if (mode == FlightMode::Supercruise) {
-            dropFromSupercruise(false);
-          } else if (mode == FlightMode::Normal) {
-            engageSupercruise();
-          }
-        }
-
-        if (key == SDLK_z) {
-          scAssist = !scAssist;
-          pushToast(toasts, scAssist ? "Supercruise assist: ON" : "Supercruise assist: OFF");
-        }
-
-        // Fuel scoop
-        if (key == SDLK_o) {
-          scoopEnabled = !scoopEnabled;
-          pushToast(toasts, scoopEnabled ? "Fuel scoop: ON" : "Fuel scoop: OFF");
-        }
-
-        // Target cycling
-        if (key == SDLK_t) {
-          if (!currentSys->stations.empty()) {
-            // cycle
-            std::size_t idx = 0;
-            if (navTarget.type == NavTargetType::Station) {
-              for (std::size_t i = 0; i < currentSys->stations.size(); ++i) {
-                if (currentSys->stations[i].id == navTarget.stationId) {
-                  idx = (i + 1) % currentSys->stations.size();
-                  break;
-                }
-              }
-            }
-            navTarget.type = NavTargetType::Station;
-            navTarget.stationId = currentSys->stations[idx].id;
-            pushToast(toasts, "Target: " + currentSys->stations[idx].name);
-          }
-        }
-
-        if (key == SDLK_y) {
-          if (!currentSys->planets.empty()) {
-            int idx = 0;
-            if (navTarget.type == NavTargetType::Planet) idx = (navTarget.planetIndex + 1) % static_cast<int>(currentSys->planets.size());
-            navTarget.type = NavTargetType::Planet;
-            navTarget.planetIndex = idx;
-            pushToast(toasts, "Target: " + currentSys->planets[static_cast<std::size_t>(idx)].name);
-          }
-        }
-
-        if (key == SDLK_g) {
-          navTarget = NavTarget{};
-          pushToast(toasts, "Target cleared.");
-        }
-      }
-    }
-
-    // Advance simulation time.
-    const double simDt = dt * timeWarpLevels[static_cast<std::size_t>(timeWarpIndex)];
-    save.timeDays += simDt / 86400.0;
-
-    // Update toast timers.
-    for (auto& t : toasts) t.timeLeftS -= dt;
-    while (!toasts.empty() && toasts.back().timeLeftS <= 0.0) toasts.pop_back();
-
-    // If in docked mode, keep ship glued.
-    if (isDocked()) {
-      auto stOpt = findStationById(*currentSys, dockedStationId);
-      if (stOpt) {
-        const auto& st = **stOpt;
-        const auto stPos = stationPosKm(st, save.timeDays);
-        const auto axis = stPos.normalized();
-        const auto stVel = orbitVelKmS(st.orbit, save.timeDays);
-        ship.setPositionKm(stPos + axis * (st.docking.radiusKm + 1.0));
-        ship.setVelocityKmS(stVel);
-      }
-    }
-
-    // Interdiction logic (supercruise only)
-    if (mode == FlightMode::Supercruise && !interdiction.active) {
-      const double cargoV = cargoValueEstimate(*currentSys, universe, save.timeDays, save.cargo);
-      if (cargoV > 250.0 && sessionRng.nextDouble() < (dt * 0.015)) {
-        // Chance per second.
-        interdiction.active = true;
-        interdiction.timeLeftS = 10.0;
-        interdiction.escapeMeter = 0.0;
-        // Random escape direction in world space.
-        const double a = sessionRng.range(0.0, 2.0 * stellar::math::kPi);
-        const double b = sessionRng.range(-0.35, 0.35);
-        interdiction.escapeDir = stellar::math::Vec3d{std::cos(a) * std::cos(b), std::sin(b), std::sin(a) * std::cos(b)}.normalized();
-
-        interdiction.pirateId = stellar::core::hashCombine(static_cast<std::uint64_t>(save.timeDays * 1000.0), sessionRng.nextU64());
-        pushToast(toasts, "INTERDICTION WARNING!");
-
-        // Spawn a fake pirate contact near the player.
-        NpcShip pirate{};
-        pirate.id = interdiction.pirateId;
-        pirate.role = NpcRole::Pirate;
-        pirate.name = makeNpcName(pirate.id, NpcRole::Pirate);
-        pirate.state = NpcState::Loiter;
-        pirate.posKm = ship.positionKm() - ship.forward() * 5000.0;
-        npcs.push_back(std::move(pirate));
-      }
-    }
-
-    if (interdiction.active) {
-      interdiction.timeLeftS -= dt;
-
-      const bool resist = (SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_R] != 0);
-      const double align = stellar::math::dot(ship.forward(), interdiction.escapeDir);
-
-      if (resist && align > 0.92) {
-        interdiction.escapeMeter += dt * (0.20 + 0.55 * (align - 0.92) / 0.08);
-      } else {
-        interdiction.escapeMeter -= dt * 0.08;
-      }
-      interdiction.escapeMeter = std::clamp(interdiction.escapeMeter, 0.0, 1.0);
-
-      if (interdiction.escapeMeter >= 1.0) {
-        interdiction.active = false;
-        pushToast(toasts, "Interdiction evaded.");
-      } else if (interdiction.timeLeftS <= 0.0) {
-        interdiction.active = false;
-        // Forced drop.
-        dropFromSupercruise(true);
-      }
-    }
-
-    // NPC update (simple)
-    for (auto& n : npcs) {
-      if (n.role != NpcRole::Trader) {
-        // Simple loiter timer.
-        if (n.state == NpcState::Loiter) {
-          n.stateTimerS -= simDt;
-          if (n.stateTimerS <= 0.0) {
-            n.stateTimerS = sessionRng.range(8.0, 40.0);
-            // Slight drift
-            n.posKm += stellar::math::Vec3d{sessionRng.range(-1.0, 1.0), sessionRng.range(-0.3, 0.3), sessionRng.range(-1.0, 1.0)} * 40.0;
-          }
-        }
-        continue;
-      }
-
-      if (n.state == NpcState::Docked) {
-        n.stateTimerS -= simDt;
-        if (n.stateTimerS <= 0.0 && n.origin != 0 && n.dest != 0 && n.origin != n.dest) {
-          auto s0 = findStationById(*currentSys, n.origin);
-          auto s1 = findStationById(*currentSys, n.dest);
-          if (!s0 || !s1) {
-            n.stateTimerS = sessionRng.range(5.0, 15.0);
-            continue;
-          }
-
-          const auto p0 = stationPosKm(**s0, save.timeDays);
-          const auto p1 = stationPosKm(**s1, save.timeDays);
-
-          // Do a small economy trade to add real scarcity.
-          if (auto pick = pickBestTrade(universe, **s0, **s1, save.timeDays, sessionRng.range(4.0, 20.0))) {
-            n.cargoCommodity = pick->first;
-            n.cargoUnits = pick->second;
-
-            auto& e0 = universe.stationEconomy(**s0, save.timeDays);
-            double dummyCredits = 1e12;
-            (void)stellar::econ::buy(e0, (*s0)->economyModel, n.cargoCommodity, n.cargoUnits, dummyCredits, 0.0, (*s0)->feeRate);
           } else {
-            n.cargoUnits = 0.0;
+            toast(toasts, "No station targeted for clearance.", 2.0);
           }
-
-          n.travelStart = p0;
-          n.travelEnd = p1;
-          const double dist = (p1 - p0).length();
-          const double speed = sessionRng.range(12000.0, 38000.0); // km/s (supercruise-ish)
-          n.travelDurationS = std::max(2.0, dist / speed);
-          n.travelT = 0.0;
-          n.state = NpcState::Travelling;
-
-          // Spawn just outside origin station.
-          n.posKm = p0 + (p0.normalized()) * 200.0;
         }
-      } else if (n.state == NpcState::Travelling) {
-        n.travelT += simDt;
-        const double u = std::clamp(n.travelT / std::max(1e-6, n.travelDurationS), 0.0, 1.0);
-        n.posKm = n.travelStart * (1.0 - u) + n.travelEnd * u;
 
-        if (u >= 1.0 - 1e-6) {
-          // Arrive; sell cargo.
-          auto s1 = findStationById(*currentSys, n.dest);
-          if (s1 && n.cargoUnits > 0.0) {
-            auto& e1 = universe.stationEconomy(**s1, save.timeDays);
-            double dummyCredits = 0.0;
-            (void)stellar::econ::sell(e1, (*s1)->economyModel, n.cargoCommodity, n.cargoUnits, dummyCredits, 0.0, (*s1)->feeRate);
+        if (event.key.keysym.sym == SDLK_g) {
+          if (docked) {
+            // Undock: place ship just outside the slot
+            const auto it = std::find_if(currentSystem->stations.begin(), currentSystem->stations.end(),
+                                         [&](const sim::Station& s){ return s.id == dockedStationId; });
+            if (it != currentSystem->stations.end()) {
+              const auto& st = *it;
+              const math::Vec3d stPos = stationPosKm(st, timeDays);
+              const math::Quatd stQ = stationOrient(st, stPos, timeDays);
+              const math::Vec3d axis = stQ.rotate({0,0,1});
+              ship.setPositionKm(stPos + axis * (st.radiusKm * 1.8));
+              ship.setVelocityKmS(stationVelKmS(st, timeDays));
+              ship.setAngularVelocityRadS({0,0,0});
+              ship.setOrientation(quatFromTo({0,0,1}, -axis));
+
+              docked = false;
+              dockedStationId = 0;
+              toast(toasts, "Undocked.", 2.0);
+            } else {
+              docked = false;
+              dockedStationId = 0;
+            }
+          } else {
+            // Dock attempt: must be inside slot tunnel, aligned, and have clearance.
+            if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+              const auto& st = currentSystem->stations[target.index];
+              auto& cs = clearances[st.id];
+              const bool clearanceValid = cs.granted && (timeDays <= cs.expiresDays);
+
+              const math::Vec3d stPos = stationPosKm(st, timeDays);
+              const math::Quatd stQ = stationOrient(st, stPos, timeDays);
+              const math::Vec3d stV = stationVelKmS(st, timeDays);
+
+              const math::Vec3d relWorldKm = ship.positionKm() - stPos;
+              const math::Vec3d relLocalKm = stQ.conjugate().rotate(relWorldKm);
+              const math::Vec3d relVelWorld = ship.velocityKmS() - stV;
+              const math::Vec3d relVelLocal = stQ.conjugate().rotate(relVelWorld);
+
+              const math::Vec3d fwdLocal = stQ.conjugate().rotate(ship.forward());
+              const math::Vec3d upLocal = stQ.conjugate().rotate(ship.up());
+
+              if (!clearanceValid) {
+                toast(toasts, "No valid clearance. Press L to request.", 2.5);
+              } else if (!dockingSlotConditions(st, relLocalKm, relVelLocal, fwdLocal, upLocal, clearanceValid)) {
+                toast(toasts, "Docking failed: align and enter the slot under speed limit.", 2.8);
+              } else {
+                // Docked: lock ship to a point inside hangar.
+                docked = true;
+                dockedStationId = st.id;
+                selectedStationIndex = (int)target.index;
+
+                ship.setVelocityKmS(stV);
+                ship.setAngularVelocityRadS({0,0,0});
+
+                toast(toasts, "Docked at " + st.name, 2.5);
+              }
+            } else {
+              toast(toasts, "Target a station (T) before docking.", 2.5);
+            }
           }
+        }
+      }
 
-          // Swap origin/dest and dock for a while.
-          std::swap(n.origin, n.dest);
-          n.state = NpcState::Docked;
-          n.stateTimerS = sessionRng.range(3.0, 18.0);
+      if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
+        if (!io.WantCaptureMouse) {
+          // Fire laser
+          if (playerLaserCooldown <= 0.0 && !docked) {
+            playerLaserCooldown = 0.18; // rate of fire
+            const double rangeKm = 120000.0;
+            const double dmg = 18.0;
+
+            const math::Vec3d aKm = ship.positionKm();
+            const math::Vec3d dir = ship.forward().normalized();
+
+            // Find best hit (simple cone + nearest along ray).
+            int bestIdx = -1;
+            double bestT = rangeKm;
+
+            for (int i = 0; i < (int)contacts.size(); ++i) {
+              auto& c = contacts[(std::size_t)i];
+              if (!c.alive) continue;
+
+              const math::Vec3d to = c.ship.positionKm() - aKm;
+              const double dist = to.length();
+              if (dist > rangeKm) continue;
+
+              const math::Vec3d toN = to / std::max(1e-9, dist);
+              const double aim = math::dot(dir, toN);
+              if (aim < 0.995) continue; // narrow cone
+
+              // approximate hit at closest along ray
+              const double t = dist * aim;
+              if (t < bestT) { bestT = t; bestIdx = i; }
+            }
+
+            const math::Vec3d bKm = aKm + dir * bestT;
+            beams.push_back({toRenderU(aKm), toRenderU(bKm), 1.0f, 0.25f, 0.25f, 0.10});
+
+            if (bestIdx >= 0) {
+              auto& hit = contacts[(std::size_t)bestIdx];
+              applyDamage(dmg, hit.shield, hit.hull);
+              if (hit.hull <= 0.0) {
+                hit.alive = false;
+                toast(toasts, "Target destroyed. +500 cr", 2.5);
+                credits += 500.0;
+              }
+            }
+          }
         }
       }
     }
 
-    // Player update
+    // Input (6DOF)
+    sim::ShipInput input{};
     const Uint8* keys = SDL_GetKeyboardState(nullptr);
 
-    if (!isDocked()) {
-      // Player input (manual)
-      stellar::sim::ShipInput input{};
-      input.dampers = dampers;
+    const bool captureKeys = io.WantCaptureKeyboard;
+    if (!captureKeys && !docked) {
+      input.thrustLocal.z += (keys[SDL_SCANCODE_W] ? 1.0 : 0.0);
+      input.thrustLocal.z -= (keys[SDL_SCANCODE_S] ? 1.0 : 0.0);
 
-      // Translation
-      //  W/S forward/back, A/D strafe left/right, Space/Ctrl up/down.
-      const double fb = (keys[SDL_SCANCODE_W] ? 1.0 : 0.0) - (keys[SDL_SCANCODE_S] ? 1.0 : 0.0);
-      const double lr = (keys[SDL_SCANCODE_D] ? 1.0 : 0.0) - (keys[SDL_SCANCODE_A] ? 1.0 : 0.0);
-      const double ud = (keys[SDL_SCANCODE_SPACE] ? 1.0 : 0.0) - (keys[SDL_SCANCODE_LCTRL] ? 1.0 : 0.0);
+      input.thrustLocal.x += (keys[SDL_SCANCODE_D] ? 1.0 : 0.0);
+      input.thrustLocal.x -= (keys[SDL_SCANCODE_A] ? 1.0 : 0.0);
 
-      // Rotation
-      const double yaw = (keys[SDL_SCANCODE_RIGHT] ? 1.0 : 0.0) - (keys[SDL_SCANCODE_LEFT] ? 1.0 : 0.0);
-      const double pitch = (keys[SDL_SCANCODE_UP] ? 1.0 : 0.0) - (keys[SDL_SCANCODE_DOWN] ? 1.0 : 0.0);
-      const double roll = (keys[SDL_SCANCODE_E] ? 1.0 : 0.0) - (keys[SDL_SCANCODE_Q] ? 1.0 : 0.0);
+      input.thrustLocal.y += (keys[SDL_SCANCODE_R] ? 1.0 : 0.0);
+      input.thrustLocal.y -= (keys[SDL_SCANCODE_F] ? 1.0 : 0.0);
 
-      // If the player starts maneuvering, drop time acceleration back to 1x.
-      const bool manualInput =
-        (std::abs(fb) > 0.01) || (std::abs(lr) > 0.01) || (std::abs(ud) > 0.01) ||
-        (std::abs(yaw) > 0.01) || (std::abs(pitch) > 0.01) || (std::abs(roll) > 0.01) ||
-        (keys[SDL_SCANCODE_LSHIFT] != 0) || (keys[SDL_SCANCODE_X] != 0);
+      input.torqueLocal.x += (keys[SDL_SCANCODE_UP] ? 1.0 : 0.0);
+      input.torqueLocal.x -= (keys[SDL_SCANCODE_DOWN] ? 1.0 : 0.0);
 
-      if (manualInput && timeWarpIndex > 0) {
-        timeWarpIndex = 0;
-        pushToast(toasts, "Time accel disengaged (manual input).");
-      }
+      input.torqueLocal.y += (keys[SDL_SCANCODE_RIGHT] ? 1.0 : 0.0);
+      input.torqueLocal.y -= (keys[SDL_SCANCODE_LEFT] ? 1.0 : 0.0);
 
-      input.thrustLocal = { lr, ud, fb };
-      input.torqueLocal = { pitch, yaw, roll };
+      input.torqueLocal.z += (keys[SDL_SCANCODE_E] ? 1.0 : 0.0);
+      input.torqueLocal.z -= (keys[SDL_SCANCODE_Q] ? 1.0 : 0.0);
 
       input.boost = keys[SDL_SCANCODE_LSHIFT] != 0;
       input.brake = keys[SDL_SCANCODE_X] != 0;
 
-      // Autopilot overrides input.
-      if (autopilot && navTarget.type != NavTargetType::None) {
-        if (auto tPos = targetWorldPosKm()) {
-          // Simple station approach autopilot.
-          if (navTarget.type == NavTargetType::Station) {
-            auto stOpt = findStationById(*currentSys, navTarget.stationId);
-            if (stOpt) {
-              const auto& st = **stOpt;
-              const auto stPos = stationPosKm(st, save.timeDays);
-              const auto stVel = orbitVelKmS(st.orbit, save.timeDays);
-              const auto axis = stPos.normalized();
-              const auto inbound = axis * -1.0;
+      static bool dampers = true;
+      if (keys[SDL_SCANCODE_Z]) dampers = true;
+      if (keys[SDL_SCANCODE_C]) dampers = false;
+      input.dampers = dampers;
+    }
 
-              const auto r = ship.positionKm() - stPos;
-              const double t = stellar::math::dot(r, axis);
-              const double lateralSq = std::max(0.0, r.lengthSq() - t * t);
-              const double lateral = std::sqrt(lateralSq);
+    // Autopilot: station approach assist (keeps you aligned to slot and under approach speed).
+    if (autopilot && !docked && target.kind == TargetKind::Station && target.index < currentSystem->stations.size() && !captureKeys) {
+      const auto& st = currentSystem->stations[target.index];
 
-              const bool inCorridor = (t >= 0.0 && t <= st.docking.corridorLengthKm && lateral <= st.docking.corridorRadiusKm);
+      const math::Vec3d stPos = stationPosKm(st, timeDays);
+      const math::Quatd stQ = stationOrient(st, stPos, timeDays);
+      const math::Vec3d stV = stationVelKmS(st, timeDays);
 
-              stellar::math::Vec3d desiredPos = stPos + axis * (st.docking.corridorLengthKm * 0.85);
-              if (inCorridor) {
-                // Move down the corridor.
-                desiredPos = stPos + axis * std::max(0.0, t - 180.0);
-              }
+      const math::Vec3d axisOut = stQ.rotate({0,0,1});
+      const math::Vec3d desiredPoint = stPos + axisOut * (st.radiusKm * 2.2); // just outside slot
 
-              // Desired velocity: relative to station.
-              const auto relPos = desiredPos - ship.positionKm();
-              const auto relVel = (ship.velocityKmS() - stVel);
+      const math::Vec3d rel = desiredPoint - ship.positionKm();
+      const double dist = rel.length();
 
-              // PD control
-              const double kp = inCorridor ? 0.015 : 0.010;
-              const double kd = 0.28;
-              stellar::math::Vec3d desiredAcc = relPos * kp - relVel * kd;
+      // Desired velocity: approach slowly as we get closer.
+      const double maxV = st.maxApproachSpeedKmS * 0.9;
+      const double vMag = std::min(maxV, 0.004 * dist); // km/s
+      const math::Vec3d desiredVel = stV + (dist > 1e-6 ? rel.normalized() * vMag : math::Vec3d{0,0,0});
 
-              // Clamp
-              const double maxA = ship.maxLinearAccelKmS2() * (input.boost ? 1.8 : 1.0);
-              const double aLen = desiredAcc.length();
-              if (aLen > maxA && aLen > 1e-9) desiredAcc *= (maxA / aLen);
+      const math::Vec3d dv = desiredVel - ship.velocityKmS();
 
-              // Convert to local thrust
-              const auto fwd = ship.forward();
-              const auto right = ship.right();
-              const auto up = ship.up();
+      // Convert desired acceleration direction to local thrust.
+      const math::Vec3d accelWorldDir = dv.normalized();
+      const math::Vec3d accelLocal = ship.orientation().conjugate().rotate(accelWorldDir);
 
-              const double ax = stellar::math::dot(desiredAcc, right) / std::max(1e-6, ship.maxLinearAccelKmS2());
-              const double ay = stellar::math::dot(desiredAcc, up) / std::max(1e-6, ship.maxLinearAccelKmS2());
-              const double az = stellar::math::dot(desiredAcc, fwd) / std::max(1e-6, ship.maxLinearAccelKmS2());
+      input.thrustLocal = accelLocal;
+      input.brake = false;
+      input.boost = false;
+      input.dampers = true;
 
-              input.thrustLocal = { std::clamp(ax, -1.0, 1.0), std::clamp(ay, -1.0, 1.0), std::clamp(az, -1.0, 1.0) };
+      // Orientation control: face into the slot (-axisOut)
+      const math::Vec3d desiredFwdWorld = (-axisOut).normalized();
+      const math::Vec3d desiredFwdLocal = ship.orientation().conjugate().rotate(desiredFwdWorld);
 
-              // Orientation: align to inbound axis once close.
-              const double wantAlign = inCorridor ? 1.0 : 0.0;
-              const double curAlign = stellar::math::dot(ship.forward(), inbound);
-              if (wantAlign > 0.5 && curAlign < 0.999) {
-                const auto axisRot = stellar::math::cross(ship.forward(), inbound);
-                const double axisLen = axisRot.length();
-                if (axisLen > 1e-6) {
-                  const auto nAxis = axisRot / axisLen;
-                  // Use axis components as torque hints (very simple).
-                  const auto local = stellar::math::Vec3d{
-                    stellar::math::dot(nAxis, right),
-                    stellar::math::dot(nAxis, up),
-                    stellar::math::dot(nAxis, fwd)
-                  };
-                  input.torqueLocal = { std::clamp(local.x * 2.0, -1.0, 1.0), std::clamp(local.y * 2.0, -1.0, 1.0), std::clamp(local.z * 1.0, -1.0, 1.0) };
-                }
-              }
+      // Yaw/pitch to bring +Z toward desired direction.
+      const double yawErr = std::atan2(desiredFwdLocal.x, desiredFwdLocal.z);
+      const double pitchErr = -std::atan2(desiredFwdLocal.y, desiredFwdLocal.z);
 
-              // If we have clearance and we are basically at the station, dock.
-              if (tryDock(st)) {
-                input.thrustLocal = {0, 0, 0};
-                input.torqueLocal = {0, 0, 0};
-              }
+      input.torqueLocal.x = std::clamp(pitchErr * 2.0, -1.0, 1.0);
+      input.torqueLocal.y = std::clamp(yawErr * 2.0, -1.0, 1.0);
+      input.torqueLocal.z = 0.0;
 
-              // Respect speed limit in corridor.
-              if (inCorridor) {
-                const double relSp = relVel.length();
-                if (relSp > st.docking.speedLimitKmS) {
-                  input.brake = true;
-                }
-              }
-            }
-          }
-        }
+      // Auto-request clearance when close enough.
+      auto& cs = clearances[st.id];
+      const double shipDist = (ship.positionKm() - stPos).length();
+      if (shipDist < st.commsRangeKm && !(cs.granted && timeDays <= cs.expiresDays) && timeDays >= cs.cooldownUntilDays) {
+        cs.granted = true;
+        cs.expiresDays = timeDays + (12.0 * 60.0) / 86400.0;
+        toast(toasts, "Autopilot: requested clearance (auto-granted).", 2.0);
       }
+    }
 
-      // Supercruise uses simplified physics for translation.
-      if (mode == FlightMode::Supercruise) {
-        // Throttle control.
-        const double dThrottle = ((keys[SDL_SCANCODE_PAGEUP] ? 1.0 : 0.0) - (keys[SDL_SCANCODE_PAGEDOWN] ? 1.0 : 0.0)) * dt * 0.35;
-        scThrottle = std::clamp(scThrottle + dThrottle, 0.0, 1.0);
-
-        // 7-second rule style assist
-        if (scAssist) {
-          if (auto tPos = targetWorldPosKm()) {
-            const double dist = (*tPos - ship.positionKm()).length();
-            const double desiredTimeS = 7.0;
-            double desiredSpeed = dist / std::max(0.5, desiredTimeS);
-            desiredSpeed = std::clamp(desiredSpeed, 2000.0, scMaxSpeedKmS);
-
-            // Convert desired speed to a throttle fraction.
-            const double targetThrottle = std::clamp(desiredSpeed / scMaxSpeedKmS, 0.0, 1.0);
-            const double rate = 0.35;
-            scThrottle += (targetThrottle - scThrottle) * std::clamp(dt * rate, 0.0, 1.0);
-          }
-        }
-
-        // Speed response
-        const double desiredSpeed = scThrottle * scMaxSpeedKmS;
-        scSpeedKmS += (desiredSpeed - scSpeedKmS) * std::clamp(dt * 0.5, 0.0, 1.0);
-
-        // Drop automatically when close to target.
-        if (auto tPos = targetWorldPosKm()) {
-          const double dist = (*tPos - ship.positionKm()).length();
-          if (dist < 1200.0 && scSpeedKmS < 9000.0) {
-            dropFromSupercruise(false);
-          }
-        }
-
-        // Very basic "mass lock": if near a station, clamp speed.
-        for (const auto& st : currentSys->stations) {
-          const double d = (stationPosKm(st, save.timeDays) - ship.positionKm()).length();
-          if (d < 5000.0) {
-            scSpeedKmS = std::min(scSpeedKmS, 12000.0);
-          }
-        }
-
-        // Use ship.step only for rotation.
-        input.thrustLocal = {0, 0, 0};
-        ship.step(simDt, input);
-
-        // Translate along forward.
-        ship.setPositionKm(ship.positionKm() + ship.forward() * (scSpeedKmS * simDt));
-
+    // Sim step
+    const double dtSim = dtReal * timeScale;
+    if (!paused) {
+      if (!docked) {
+        ship.step(dtSim, input);
       } else {
-        // Normal flight.
-        ship.step(simDt, input);
-      }
-    }
+        // While docked, keep ship attached to station.
+        auto it = std::find_if(currentSystem->stations.begin(), currentSystem->stations.end(),
+                               [&](const sim::Station& s){ return s.id == dockedStationId; });
+        if (it != currentSystem->stations.end()) {
+          const auto& st = *it;
+          const math::Vec3d stPos = stationPosKm(st, timeDays);
+          const math::Quatd stQ = stationOrient(st, stPos, timeDays);
+          const math::Vec3d stV = stationVelKmS(st, timeDays);
 
-    // Fuel scoop + heat model
-    {
-      const double starRadiusKm = currentSys->star.radiusSol * kSolarRadiusKm;
-      const double distToStar = ship.positionKm().length();
-
-      const double scoopMin = starRadiusKm * 2.0;
-      const double scoopMax = starRadiusKm * 55.0;
-
-      // Heat rises when close.
-      const double closeness = std::clamp(1.0 - (distToStar - scoopMin) / std::max(1.0, scoopMax - scoopMin), 0.0, 1.0);
-      const double heatGain = closeness * closeness * (scoopEnabled ? 0.35 : 0.22);
-
-      // Heat also rises a bit with very high supercruise speeds.
-      const double scHeat = (mode == FlightMode::Supercruise) ? std::clamp(scSpeedKmS / scMaxSpeedKmS, 0.0, 1.0) * 0.08 : 0.0;
-
-      heat += (heatGain + scHeat) * dt;
-      heat -= 0.18 * dt;
-      heat = std::max(0.0, heat);
-
-      // Scoop fuel if enabled and in range.
-      if (scoopEnabled && distToStar > scoopMin && distToStar < scoopMax) {
-        const double rate = 1.2 + 1.8 * closeness; // units / second
-        fuel = std::min(fuelMax, fuel + rate * dt);
-      }
-
-      if (heat > 1.0) {
-        hull = std::max(0.0, hull - (heat - 1.0) * 0.035 * dt);
-        if (mode == FlightMode::Supercruise) {
-          // Overheat forces drop.
-          dropFromSupercruise(true);
-        }
-      }
-    }
-
-    // Auto-dock if physically right on top of a station.
-    if (mode == FlightMode::Normal && !isDocked()) {
-      for (const auto& st : currentSys->stations) {
-        if (tryDock(st)) break;
-      }
-    }
-
-    // If hull is dead, reset.
-    if (hull <= 0.0) {
-      hull = 1.0;
-      fuel = std::max(fuelMax * 0.35, fuel);
-      save.credits = std::max(0.0, save.credits - 200.0);
-      pushToast(toasts, "Ship destroyed! Emergency recovery fee paid.");
-
-      // Respawn at first station.
-      if (!currentSys->stations.empty()) {
-        const auto& st = currentSys->stations.front();
-        const auto p = stationPosKm(st, save.timeDays);
-        ship.setPositionKm(p + p.normalized() * (st.docking.corridorLengthKm * 0.9));
-        ship.setVelocityKmS(orbitVelKmS(st.orbit, save.timeDays));
-      }
-      setMode(FlightMode::Normal);
-    }
-
-    // Mission completion / failure checks.
-    for (auto& m : activeMissions) {
-      if (m.completed || m.failed) continue;
-      if (save.timeDays > m.deadlineDay) {
-        m.failed = true;
-        pushToast(toasts, "Mission failed (deadline).", 6.0);
-        continue;
-      }
-
-      if (isDocked() && dockedStationId == m.toStation && save.currentSystem == m.toSystem) {
-        if (m.type == stellar::sim::MissionType::Courier) {
-          m.completed = true;
-          save.credits += m.reward;
-          pushToast(toasts, "Courier completed. +" + std::to_string(static_cast<int>(m.reward)) + " cr");
-        } else if (m.type == stellar::sim::MissionType::Delivery) {
-          const std::size_t cid = static_cast<std::size_t>(m.commodity);
-          if (save.cargo[cid] >= m.units) {
-            save.cargo[cid] -= m.units;
-            m.completed = true;
-            save.credits += m.reward;
-            pushToast(toasts, "Delivery completed. +" + std::to_string(static_cast<int>(m.reward)) + " cr");
-          }
+          const double wz = st.radiusKm * 1.10;
+          const double dockZ = wz - st.slotDepthKm - st.radiusKm * 0.25;
+          const math::Vec3d dockLocal{0,0, dockZ};
+          ship.setPositionKm(stPos + stQ.rotate(dockLocal));
+          ship.setVelocityKmS(stV);
+          ship.setOrientation(stQ * math::Quatd::fromAxisAngle({0,1,0}, math::kPi)); // face outward-ish
         }
       }
 
-      if (m.type == stellar::sim::MissionType::BountyScan && !m.completed && !m.failed) {
-        // Scan completes in space: be near target NPC and hold V.
-        if (save.currentSystem == m.toSystem && m.targetNpcId != 0) {
-          for (const auto& n : npcs) {
-            if (n.id != m.targetNpcId) continue;
-            const double d = (n.posKm - ship.positionKm()).length();
-            if (d < 12.0) {
-              if (keys[SDL_SCANCODE_V]) {
-                // immediate for now
-                m.completed = true;
-                save.credits += m.reward;
-                pushToast(toasts, "Bounty scan complete. +" + std::to_string(static_cast<int>(m.reward)) + " cr");
-              }
+      // Spawn pirates occasionally (simple "threat" loop).
+      if (timeDays >= nextPirateSpawnDays && contacts.size() < 8) {
+        nextPirateSpawnDays = timeDays + (rng.range(120.0, 220.0) / 86400.0); // every ~2-4 minutes
+
+        Contact p{};
+        p.pirate = true;
+        p.name = "Pirate " + std::to_string((int)contacts.size() + 1);
+        p.ship.setMaxLinearAccelKmS2(0.06);
+        p.ship.setMaxAngularAccelRadS2(0.9);
+
+        // Spawn somewhere near the player, but not too close.
+        const math::Vec3d randDir = math::Vec3d{rng.range(-1.0,1.0), rng.range(-0.3,0.3), rng.range(-1.0,1.0)}.normalized();
+        const double distKm = rng.range(50000.0, 120000.0);
+        p.ship.setPositionKm(ship.positionKm() + randDir * distKm);
+        p.ship.setVelocityKmS(ship.velocityKmS());
+        p.ship.setOrientation(quatFromTo({0,0,1}, (-randDir).normalized()));
+
+        contacts.push_back(std::move(p));
+        toast(toasts, "Contact: pirate detected!", 3.0);
+      }
+
+      // Contacts AI + combat
+      for (auto& c : contacts) {
+        if (!c.alive) continue;
+
+        // cooldowns
+        c.fireCooldown = std::max(0.0, c.fireCooldown - dtSim);
+        if (c.pirate) {
+          // chase player
+          sim::ShipInput ai{};
+          ai.dampers = true;
+
+          const math::Vec3d to = ship.positionKm() - c.ship.positionKm();
+          const double dist = to.length();
+          const math::Vec3d toN = (dist > 1e-6) ? to / dist : math::Vec3d{0,0,1};
+
+          // Face player
+          const math::Vec3d desiredFwdWorld = toN;
+          const math::Vec3d desiredFwdLocal = c.ship.orientation().conjugate().rotate(desiredFwdWorld);
+          const double yawErr = std::atan2(desiredFwdLocal.x, desiredFwdLocal.z);
+          const double pitchErr = -std::atan2(desiredFwdLocal.y, desiredFwdLocal.z);
+          ai.torqueLocal.x = std::clamp(pitchErr * 1.8, -1.0, 1.0);
+          ai.torqueLocal.y = std::clamp(yawErr * 1.8, -1.0, 1.0);
+
+          // Thrust: try to keep a standoff distance.
+          const double desiredDist = 35000.0;
+          double vAim = 0.0;
+          if (dist > desiredDist) vAim = std::min(0.22, 0.000004 * (dist - desiredDist));
+          if (dist < desiredDist*0.6) vAim = -0.12;
+
+          const math::Vec3d desiredVel = ship.velocityKmS() + toN * vAim;
+          const math::Vec3d dv = desiredVel - c.ship.velocityKmS();
+          const math::Vec3d accelWorldDir = (dv.lengthSq() > 1e-9) ? dv.normalized() : math::Vec3d{0,0,0};
+          ai.thrustLocal = c.ship.orientation().conjugate().rotate(accelWorldDir);
+
+          c.ship.step(dtSim, ai);
+
+          // Fire if aligned
+          if (c.fireCooldown <= 0.0 && dist < 90000.0) {
+            const double aim = math::dot(c.ship.forward().normalized(), toN);
+            if (aim > 0.992) {
+              c.fireCooldown = 0.35;
+              const double dmg = 11.0;
+              applyDamage(dmg, playerShield, playerHull);
+
+              const math::Vec3d aKm = c.ship.positionKm();
+              const math::Vec3d bKm = ship.positionKm();
+              beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.95f, 0.45f, 0.10f, 0.08});
             }
           }
         }
       }
+
+      // Station turrets: in station vicinity, help against pirates.
+      for (const auto& st : currentSystem->stations) {
+        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const double zoneKm = st.radiusKm * 25.0;
+        const double distShip = (ship.positionKm() - stPos).length();
+        if (distShip > zoneKm) continue; // only if player is nearby
+
+        // Shoot a pirate every so often
+        for (auto& c : contacts) {
+          if (!c.alive || !c.pirate) continue;
+          const double d = (c.ship.positionKm() - stPos).length();
+          if (d < zoneKm) {
+            // apply light damage (feel of station defenses)
+            applyDamage(4.0 * dtSim, c.shield, c.hull);
+            if (c.hull <= 0.0) {
+              c.alive = false;
+              credits += 250.0;
+              toast(toasts, "Station defenses destroyed a pirate (+250).", 2.5);
+            }
+          }
+        }
+      }
+
+      // Collisions (player with station hull)
+      if (!docked) {
+        for (const auto& st : currentSystem->stations) {
+          const math::Vec3d stPos = stationPosKm(st, timeDays);
+          const math::Quatd stQ = stationOrient(st, stPos, timeDays);
+          const math::Vec3d relLocal = stQ.conjugate().rotate(ship.positionKm() - stPos);
+
+          if (insideStationHullExceptSlot(st, relLocal)) {
+            // Damage based on relative speed and push outward slightly.
+            const math::Vec3d stV = stationVelKmS(st, timeDays);
+            const double relSpeed = (ship.velocityKmS() - stV).length();
+            applyDamage(relSpeed * 18.0, playerShield, playerHull);
+
+            // Push out along local axis with largest penetration.
+            const double wx = st.radiusKm * 0.70;
+            const double wy = st.radiusKm * 0.70;
+            const double wz = st.radiusKm * 1.10;
+
+            double dx = wx - std::abs(relLocal.x);
+            double dy = wy - std::abs(relLocal.y);
+            double dz = wz - std::abs(relLocal.z);
+
+            math::Vec3d pushLocal{0,0,0};
+            if (dx <= dy && dx <= dz) pushLocal.x = (relLocal.x >= 0 ? 1 : -1) * (dx + 200.0);
+            else if (dy <= dz) pushLocal.y = (relLocal.y >= 0 ? 1 : -1) * (dy + 200.0);
+            else pushLocal.z = (relLocal.z >= 0 ? 1 : -1) * (dz + 200.0);
+
+            ship.setPositionKm(ship.positionKm() + stQ.rotate(pushLocal));
+            ship.setVelocityKmS(stV); // kill relative motion on impact
+            toast(toasts, "Collision!", 1.2);
+            break;
+          }
+        }
+      }
+
+      timeDays += dtSim / 86400.0;
+
+      playerLaserCooldown = std::max(0.0, playerLaserCooldown - dtSim);
+
+      // Shield regen (slow)
+      if (!paused && playerHull > 0.0 && playerShield < 100.0) {
+        playerShield = std::min(100.0, playerShield + 2.5 * (dtSim / 60.0));
+      }
     }
 
-    // Save persistent values back into save struct each frame.
-    save.shipPosKm = ship.positionKm();
-    save.shipVelKmS = ship.velocityKmS();
-    save.shipOrient = ship.orientation();
-    save.shipAngVelRadS = ship.angularVelocityRadS();
+    // Death / respawn
+    if (playerHull <= 0.0) {
+      toast(toasts, "Ship destroyed! Respawning (lost cargo, -10% credits).", 4.0);
+      playerHull = 100.0;
+      playerShield = 60.0;
+      credits *= 0.90;
+      cargo.fill(0.0);
+      docked = true;
+      if (!currentSystem->stations.empty()) {
+        dockedStationId = currentSystem->stations.front().id;
+        selectedStationIndex = 0;
+      } else {
+        dockedStationId = 0;
+      }
+      // Will snap to dock position next tick.
+    }
 
-    save.fuel = fuel;
-    save.fuelMax = fuelMax;
-    save.hull = hull;
-    save.cargoCapacityKg = cargoCapacityKg;
-    save.fsdReadyDay = fsdReadyDay;
-    save.missions = activeMissions;
-    save.nextMissionId = nextMissionId;
+    // Update beam TTL
+    for (auto& b : beams) b.ttl -= dtReal;
+    beams.erase(std::remove_if(beams.begin(), beams.end(), [](const Beam& b){ return b.ttl <= 0.0; }), beams.end());
 
-    // Update station overrides snapshot occasionally.
-    save.stationOverrides = universe.exportStationOverrides();
+    // Toast TTL
+    for (auto& t : toasts) t.ttl -= dtReal;
+    toasts.erase(std::remove_if(toasts.begin(), toasts.end(), [](const ToastMsg& t){ return t.ttl <= 0.0; }), toasts.end());
 
-    // ---------------- Rendering ----------------
-
+    // ---- Camera follow (third-person) ----
+    render::Camera cam;
     int w = 1280, h = 720;
     SDL_GetWindowSize(window, &w, &h);
-    cam.setPerspective(stellar::math::degToRad(70.0), static_cast<double>(w) / static_cast<double>(h), 0.01, 25000.0);
+    const double aspect = (h > 0) ? (double)w / (double)h : 16.0/9.0;
 
-    // Camera: third-person behind ship
-    const double worldScale = 1.0 / 1e6; // 1 unit = 1e6 km
-    const auto shipPosU = ship.positionKm() * worldScale;
+    cam.setPerspective(math::degToRad(60.0), aspect, 0.01, 20000.0);
 
-    const auto forward = ship.forward();
-    const auto camPosKm = ship.positionKm() - forward * 220.0 + stellar::math::Vec3d{0, 60.0, 0};
-    cam.setPosition(camPosKm * worldScale);
+    const math::Vec3d shipPosU = toRenderU(ship.positionKm());
+    const math::Vec3d back = ship.forward() * (-6.0);
+    const math::Vec3d up = ship.up() * (2.0);
+
+    cam.setPosition(shipPosU + back + up);
     cam.setOrientation(ship.orientation());
 
-    const auto view = cam.viewMatrix();
-    const auto proj = cam.projectionMatrix();
+    const math::Mat4d view = cam.viewMatrix();
+    const math::Mat4d proj = cam.projectionMatrix();
 
-    float viewF[16];
-    float projF[16];
-    for (int i = 0; i < 16; ++i) {
-      viewF[i] = static_cast<float>(view.m[i]);
-      projF[i] = static_cast<float>(proj.m[i]);
-    }
+    float viewF[16], projF[16];
+    matToFloat(view, viewF);
+    matToFloat(proj, projF);
 
     meshRenderer.setViewProj(viewF, projF);
     lineRenderer.setViewProj(viewF, projF);
-    pointRenderer.setViewProj(viewF, projF);
 
-    // Instances
-    std::vector<stellar::render::InstanceData> cubes;
-    std::vector<stellar::render::InstanceData> spheres;
-    cubes.reserve(256);
-    spheres.reserve(512);
+    // ---- Build instances (star + planets) ----
+    std::vector<render::InstanceData> spheres;
+    spheres.reserve(1 + currentSystem->planets.size());
 
-    // Star
+    // Star at origin
     {
-      stellar::render::InstanceData s{};
-      s.px = 0.0f;
-      s.py = 0.0f;
-      s.pz = 0.0f;
-      const double r = currentSys->star.radiusSol * kSolarRadiusKm * worldScale;
-      s.scale = static_cast<float>(std::clamp(r, 0.002, 1.5));
-      s.cr = 1.0f;
-      s.cg = 0.95f;
-      s.cb = 0.75f;
-      spheres.push_back(s);
+      const double starRadiusKm = currentSystem->star.radiusSol * kSOLAR_RADIUS_KM;
+      const float starScale = (float)std::max(0.8, (starRadiusKm / kRENDER_UNIT_KM) * 3.0);
+      spheres.push_back(makeInstUniform({0,0,0}, starScale, 1.0f, 0.95f, 0.75f));
     }
 
     // Planets
-    for (const auto& p : currentSys->planets) {
-      const auto pk = planetPosKm(p, save.timeDays) * worldScale;
+    for (const auto& p : currentSystem->planets) {
+      const math::Vec3d posAU = sim::orbitPosition3DAU(p.orbit, timeDays);
+      const math::Vec3d posKm = posAU * kAU_KM;
+      const math::Vec3d posU = toRenderU(posKm);
 
-      stellar::render::InstanceData inst{};
-      inst.px = static_cast<float>(pk.x);
-      inst.py = static_cast<float>(pk.y);
-      inst.pz = static_cast<float>(pk.z);
-      inst.scale = static_cast<float>(0.0025 + 0.0012 * p.radiusEarth);
+      const double radiusKm = p.radiusEarth * kEARTH_RADIUS_KM;
+      const float scale = (float)std::max(0.25, (radiusKm / kRENDER_UNIT_KM) * 200.0);
 
-      // color by type
+      // Simple color palette by type
+      float cr=0.6f, cg=0.6f, cb=0.6f;
       switch (p.type) {
-        case stellar::sim::PlanetType::Rocky:   inst.cr = 0.7f; inst.cg = 0.5f; inst.cb = 0.4f; break;
-        case stellar::sim::PlanetType::Desert:  inst.cr = 0.9f; inst.cg = 0.7f; inst.cb = 0.3f; break;
-        case stellar::sim::PlanetType::Ocean:   inst.cr = 0.2f; inst.cg = 0.5f; inst.cb = 0.9f; break;
-        case stellar::sim::PlanetType::Ice:     inst.cr = 0.8f; inst.cg = 0.9f; inst.cb = 1.0f; break;
-        case stellar::sim::PlanetType::GasGiant:inst.cr = 0.6f; inst.cg = 0.8f; inst.cb = 0.5f; break;
-        default: inst.cr = inst.cg = inst.cb = 1.0f; break;
+        case sim::PlanetType::Rocky: cr=0.6f; cg=0.55f; cb=0.5f; break;
+        case sim::PlanetType::Desert: cr=0.8f; cg=0.7f; cb=0.35f; break;
+        case sim::PlanetType::Ocean: cr=0.25f; cg=0.45f; cb=0.85f; break;
+        case sim::PlanetType::Ice: cr=0.7f; cg=0.85f; cb=0.95f; break;
+        case sim::PlanetType::GasGiant: cr=0.7f; cg=0.55f; cb=0.35f; break;
+        default: break;
       }
 
-      spheres.push_back(inst);
+      spheres.push_back(makeInstUniform(posU, scale, cr,cg,cb));
     }
 
-    // Stations
-    for (const auto& st : currentSys->stations) {
-      const auto sk = stationPosKm(st, save.timeDays) * worldScale;
-      const auto c = stationTypeColor(st.type);
+    // Orbit lines (planets)
+    std::vector<render::LineVertex> lines;
+    lines.reserve(currentSystem->planets.size() * 128 + currentSystem->stations.size() * 64 + beams.size() * 2);
 
-      stellar::render::InstanceData inst{};
-      inst.px = static_cast<float>(sk.x);
-      inst.py = static_cast<float>(sk.y);
-      inst.pz = static_cast<float>(sk.z);
-      inst.scale = static_cast<float>(std::clamp(st.docking.radiusKm * worldScale * 0.7, 0.0012, 0.03));
-      inst.cr = c.x;
-      inst.cg = c.y;
-      inst.cb = c.z;
-      cubes.push_back(inst);
-    }
+    for (const auto& p : currentSystem->planets) {
+      const int seg = 96;
+      math::Vec3d prev{};
+      for (int s = 0; s <= seg; ++s) {
+        const double t = (double)s / (double)seg * p.orbit.periodDays;
+        const math::Vec3d posAU = sim::orbitPosition3DAU(p.orbit, t);
+        const math::Vec3d posU = toRenderU(posAU * kAU_KM);
 
-    // NPC contacts
-    for (const auto& n : npcs) {
-      const auto nk = n.posKm * worldScale;
-      stellar::render::InstanceData inst{};
-      inst.px = static_cast<float>(nk.x);
-      inst.py = static_cast<float>(nk.y);
-      inst.pz = static_cast<float>(nk.z);
-      inst.scale = 0.0012f;
-
-      if (n.role == NpcRole::Trader) { inst.cr = 0.2f; inst.cg = 0.9f; inst.cb = 0.8f; }
-      else if (n.role == NpcRole::Pirate) { inst.cr = 0.95f; inst.cg = 0.2f; inst.cb = 0.2f; }
-      else { inst.cr = 0.25f; inst.cg = 0.55f; inst.cb = 0.95f; }
-
-      cubes.push_back(inst);
-    }
-
-    // Player ship
-    {
-      stellar::render::InstanceData inst{};
-      inst.px = static_cast<float>(shipPosU.x);
-      inst.py = static_cast<float>(shipPosU.y);
-      inst.pz = static_cast<float>(shipPosU.z);
-      inst.scale = 0.0016f;
-      inst.cr = 1.0f;
-      inst.cg = 1.0f;
-      inst.cb = 1.0f;
-      cubes.push_back(inst);
-    }
-
-    // Docking corridor lines (target station)
-    std::vector<stellar::render::LineVertex> lines;
-    if (navTarget.type == NavTargetType::Station) {
-      auto stOpt = findStationById(*currentSys, navTarget.stationId);
-      if (stOpt) {
-        const auto& st = **stOpt;
-        const auto p = stationPosKm(st, save.timeDays);
-        const auto axis = p.normalized();
-
-        // Draw a simple center line.
-        const auto p0 = p;
-        const auto p1 = p + axis * st.docking.corridorLengthKm;
-
-        stellar::render::LineVertex a{};
-        a.px = static_cast<float>((p0.x * worldScale));
-        a.py = static_cast<float>((p0.y * worldScale));
-        a.pz = static_cast<float>((p0.z * worldScale));
-        a.cr = 1.0f; a.cg = 0.9f; a.cb = 0.2f;
-
-        stellar::render::LineVertex b{};
-        b.px = static_cast<float>((p1.x * worldScale));
-        b.py = static_cast<float>((p1.y * worldScale));
-        b.pz = static_cast<float>((p1.z * worldScale));
-        b.cr = 1.0f; b.cg = 0.9f; b.cb = 0.2f;
-
-        lines.push_back(a);
-        lines.push_back(b);
+        if (s > 0) {
+          lines.push_back({(float)prev.x,(float)prev.y,(float)prev.z, 0.22f,0.22f,0.25f});
+          lines.push_back({(float)posU.x,(float)posU.y,(float)posU.z, 0.22f,0.22f,0.25f});
+        }
+        prev = posU;
       }
     }
 
-    // Starfield points (cheap, deterministic)
-    std::vector<stellar::render::PointVertex> stars;
-    {
-      constexpr int kStars = 600;
-      stars.reserve(kStars);
-      stellar::core::SplitMix64 rng(stellar::core::hashCombine(save.seed, 0xDEADBEEF));
-      for (int i = 0; i < kStars; ++i) {
-        const double r = rng.range(4000.0, 20000.0);
-        const double a = rng.range(0.0, 2.0 * stellar::math::kPi);
-        const double b = rng.range(-0.85, 0.85);
+    // Station orbit lines + slot axis lines
+    for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+      const auto& st = currentSystem->stations[i];
 
-        const double x = std::cos(a) * std::cos(b) * r;
-        const double y = std::sin(b) * r;
-        const double z = std::sin(a) * std::cos(b) * r;
+      // orbit (fewer segs, stations are secondary)
+      const int seg = 48;
+      math::Vec3d prev{};
+      for (int s = 0; s <= seg; ++s) {
+        const double t = (double)s / (double)seg * st.orbit.periodDays;
+        const math::Vec3d posU = toRenderU(sim::orbitPosition3DAU(st.orbit, t) * kAU_KM);
+        if (s > 0) {
+          lines.push_back({(float)prev.x,(float)prev.y,(float)prev.z, 0.16f,0.18f,0.22f});
+          lines.push_back({(float)posU.x,(float)posU.y,(float)posU.z, 0.16f,0.18f,0.22f});
+        }
+        prev = posU;
+      }
 
-        stellar::render::PointVertex pv{};
-        pv.px = static_cast<float>(x);
-        pv.py = static_cast<float>(y);
-        pv.pz = static_cast<float>(z);
-        const float c = static_cast<float>(rng.range(0.7, 1.0));
-        pv.cr = c;
-        pv.cg = c;
-        pv.cb = c;
-        pv.size = static_cast<float>(rng.range(1.0, 2.2));
-        stars.push_back(pv);
+      // approach corridor axis for targeted station
+      if (target.kind == TargetKind::Station && target.index == i) {
+        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const math::Quatd stQ = stationOrient(st, stPos, timeDays);
+        const math::Vec3d axis = stQ.rotate({0,0,1});
+        const math::Vec3d aU = toRenderU(stPos + axis * (st.radiusKm * 1.1));
+        const math::Vec3d bU = toRenderU(stPos + axis * (st.radiusKm * 1.1 + st.approachLengthKm));
+        lines.push_back({(float)aU.x,(float)aU.y,(float)aU.z, 0.35f,0.85f,0.45f});
+        lines.push_back({(float)bU.x,(float)bU.y,(float)bU.z, 0.35f,0.85f,0.45f});
       }
     }
 
-    // Clear
-    stellar::render::gl::Viewport(0, 0, w, h);
-    stellar::render::gl::Enable(GL_DEPTH_TEST);
-    stellar::render::gl::ClearColor(0.02f, 0.03f, 0.05f, 1.0f);
-    stellar::render::gl::Clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    // Laser beams
+    for (const auto& b : beams) {
+      lines.push_back({(float)b.aU.x,(float)b.aU.y,(float)b.aU.z, b.r,b.g,b.b});
+      lines.push_back({(float)b.bU.x,(float)b.bU.y,(float)b.bU.z, b.r,b.g,b.b});
+    }
 
-    pointRenderer.drawPoints(stars);
+    // Station geometry (cubes)
+    std::vector<render::InstanceData> cubes;
+    cubes.reserve(1 + currentSystem->stations.size() * 18 + contacts.size());
 
-    // Draw planets + star
+    for (const auto& st : currentSystem->stations) {
+      const math::Vec3d stPos = stationPosKm(st, timeDays);
+      const math::Quatd stQ = stationOrient(st, stPos, timeDays);
+      emitStationGeometry(st, stPos, stQ, cubes);
+    }
+
+    // Ship instance (cube, rotated)
+    cubes.push_back(makeInst(toRenderU(ship.positionKm()),
+                             {0.35, 0.20, 0.60},
+                             ship.orientation(),
+                             0.90f, 0.90f, 1.00f));
+
+    // Contacts (pirates)
+    for (const auto& c : contacts) {
+      if (!c.alive) continue;
+      const float r = c.pirate ? 1.0f : 0.6f;
+      const float g = c.pirate ? 0.25f : 0.7f;
+      const float b = c.pirate ? 0.25f : 0.8f;
+      cubes.push_back(makeInst(toRenderU(c.ship.positionKm()),
+                               {0.25, 0.18, 0.45},
+                               c.ship.orientation(),
+                               r,g,b));
+    }
+
+    // ---- Render ---
+    glViewport(0, 0, w, h);
+    glClearColor(0.01f, 0.01f, 0.02f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Lines (orbits, corridor, beams)
+    lineRenderer.drawLines(lines);
+
+    // Star + planets
     meshRenderer.setMesh(&sphere);
     meshRenderer.drawInstances(spheres);
 
-    // Draw cubes
+    // Cubes (stations, ship, contacts)
     meshRenderer.setMesh(&cube);
     meshRenderer.drawInstances(cubes);
 
-    // Draw corridor lines
-    if (!lines.empty()) lineRenderer.drawLines(lines);
-
-    // ---------------- ImGui ----------------
+    // ---- UI ----
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL2_NewFrame(window);
     ImGui::NewFrame();
 
-    const ImVec2 vpSize = ImGui::GetIO().DisplaySize;
+    ImGui::DockSpaceOverViewport(ImGui::GetMainViewport());
 
-    // HUD overlay
+    // HUD overlay: target marker + crosshair + toasts
     {
-      ImGui::SetNextWindowPos({10, 10});
-      ImGui::SetNextWindowBgAlpha(0.35f);
-      ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize;
-      ImGui::Begin("HUD", nullptr, flags);
+      ImDrawList* draw = ImGui::GetForegroundDrawList();
+      const ImVec2 center((float)w * 0.5f, (float)h * 0.5f);
+      draw->AddLine({center.x - 8, center.y}, {center.x + 8, center.y}, IM_COL32(160,160,170,140), 1.0f);
+      draw->AddLine({center.x, center.y - 8}, {center.x, center.y + 8}, IM_COL32(160,160,170,140), 1.0f);
 
-      const double speed = ship.velocityKmS().length();
-      const char* modeName = (mode == FlightMode::Docked) ? "Docked" : (mode == FlightMode::Supercruise) ? "Supercruise" : "Normal";
+      // Target marker
+      std::optional<math::Vec3d> tgtKm{};
+      std::string tgtLabel;
 
-      ImGui::Text("System: %s", currentSystemName().c_str());
-      ImGui::Text("Mode: %s", modeName);
-      ImGui::Text("Time: day %.2f (x%.0f)", save.timeDays, timeWarpLevels[static_cast<std::size_t>(timeWarpIndex)]);
-      ImGui::Separator();
-
-      ImGui::Text("Speed: %.2f km/s", speed);
-      if (mode == FlightMode::Supercruise) {
-        ImGui::Text("SC Speed: %.0f km/s  Throttle: %.0f%%", scSpeedKmS, scThrottle * 100.0);
-      }
-
-      ImGui::Text("Fuel: %.1f / %.1f", fuel, fuelMax);
-      ImGui::Text("Heat: %.0f%%", heat * 100.0);
-      ImGui::Text("Hull: %.0f%%", hull * 100.0);
-
-      const double cm = cargoMassKg(save.cargo);
-      ImGui::Text("Cargo: %.1f / %.1f kg", cm, cargoCapacityKg);
-      ImGui::Text("Credits: %.0f", save.credits);
-
-      ImGui::Separator();
-      ImGui::Text("Target: %s", targetName().c_str());
-      if (auto tPos = targetWorldPosKm()) {
-        const double d = (*tPos - ship.positionKm()).length();
-        ImGui::Text("Dist: %.0f km", d);
-        if (mode == FlightMode::Supercruise && scSpeedKmS > 1.0) {
-          ImGui::Text("TtT: %.1f s", d / scSpeedKmS);
+      if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+        const auto& st = currentSystem->stations[target.index];
+        tgtKm = stationPosKm(st, timeDays);
+        tgtLabel = st.name;
+      } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+        const auto& p = currentSystem->planets[target.index];
+        tgtKm = sim::orbitPosition3DAU(p.orbit, timeDays) * kAU_KM;
+        tgtLabel = p.name;
+      } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
+        const auto& c = contacts[target.index];
+        if (c.alive) {
+          tgtKm = c.ship.positionKm();
+          tgtLabel = c.name;
         }
       }
 
-      if (interdiction.active) {
-        ImGui::Separator();
-        ImGui::TextColored({1.0f, 0.25f, 0.25f, 1.0f}, "INTERDICTION!");
-        ImGui::Text("Hold R and align with escape dir.");
-        ImGui::ProgressBar(static_cast<float>(interdiction.escapeMeter), ImVec2(180, 0));
-        ImGui::Text("%.1f s", interdiction.timeLeftS);
+      if (tgtKm) {
+        ImVec2 px{};
+        if (projectToScreen(toRenderU(*tgtKm), view, proj, w, h, px)) {
+          const double distKm = (*tgtKm - ship.positionKm()).length();
+          draw->AddCircle({px.x, px.y}, 14.0f, IM_COL32(255,170,80,190), 1.5f);
+          std::string s = tgtLabel + "  " + std::to_string((int)distKm) + " km";
+          draw->AddText({px.x + 18, px.y - 8}, IM_COL32(255,210,170,210), s.c_str());
+        }
       }
 
-      ImGui::End();
-    }
-
-    // Toasts (bottom-left)
-    {
-      ImGui::SetNextWindowPos({10, vpSize.y - 10}, 0, {0, 1});
-      ImGui::SetNextWindowBgAlpha(0.0f);
-      ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize;
-      ImGui::Begin("Toasts", nullptr, flags);
+      // Toasts
+      float y = 18.0f;
       for (const auto& t : toasts) {
-        ImGui::TextUnformatted(t.text.c_str());
+        draw->AddText({18.0f, y}, IM_COL32(240,240,240,220), t.text.c_str());
+        y += 18.0f;
       }
-      ImGui::End();
     }
 
-    if (showHelp) {
-      ImGui::Begin("Help / Controls", &showHelp);
-      ImGui::Text("Flight:");
-      ImGui::BulletText("W/S = forward/back thrusters");
-      ImGui::BulletText("A/D = strafe left/right");
-      ImGui::BulletText("Space/Ctrl = up/down");
-      ImGui::BulletText("Arrow keys = pitch/yaw");
-      ImGui::BulletText("Q/E = roll");
-      ImGui::BulletText("Shift = boost, X = brake, F = flight assist");
-      ImGui::Separator();
-      ImGui::Text("Nav / progression:");
-      ImGui::BulletText("T = cycle station targets, Y = cycle planets, G = clear target");
-      ImGui::BulletText("B = toggle Supercruise, Z = toggle SC Assist (7s rule)");
-      ImGui::BulletText("O = toggle Fuel Scoop");
-      ImGui::BulletText("L = request docking clearance, P = toggle autopilot, U = undock");
-      ImGui::BulletText("1..5 = time accel levels (restricted)");
-      ImGui::BulletText("Hold V near bounty target to scan");
-      ImGui::Separator();
-      ImGui::Text("UI: F1..F5 toggles panels.");
-      ImGui::End();
-    }
+    if (showShip) {
+      ImGui::Begin("Ship / Flight");
 
-    // Nav panel
-    if (showNav) {
-      ImGui::Begin("Navigation", &showNav);
-      ImGui::Text("Stations:");
-      for (const auto& st : currentSys->stations) {
-        const bool selected = (navTarget.type == NavTargetType::Station && navTarget.stationId == st.id);
-        if (ImGui::Selectable((st.name + "##st").c_str(), selected)) {
-          navTarget.type = NavTargetType::Station;
-          navTarget.stationId = st.id;
-        }
-      }
+      const auto pos = ship.positionKm();
+      const auto vel = ship.velocityKmS();
+      const auto wv  = ship.angularVelocityRadS();
+
+      ImGui::Text("Time: %.2f days  (x%.1f) %s", timeDays, timeScale, paused ? "[PAUSED]" : "");
+      ImGui::SliderFloat("Time scale (sim sec / real sec)", (float*)&timeScale, 0.0f, 2000.0f);
+
       ImGui::Separator();
-      ImGui::Text("Planets:");
-      for (int i = 0; i < static_cast<int>(currentSys->planets.size()); ++i) {
-        const auto& p = currentSys->planets[static_cast<std::size_t>(i)];
-        const bool selected = (navTarget.type == NavTargetType::Planet && navTarget.planetIndex == i);
-        if (ImGui::Selectable((p.name + "##pl").c_str(), selected)) {
-          navTarget.type = NavTargetType::Planet;
-          navTarget.planetIndex = i;
-        }
+      ImGui::Text("Hull: %.0f / 100   Shield: %.0f / 100", playerHull, playerShield);
+      ImGui::Text("Laser cooldown: %.2fs", playerLaserCooldown);
+
+      if (docked) {
+        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "DOCKED");
+      } else {
+        ImGui::TextDisabled("Not docked");
       }
-      ImGui::Separator();
-      ImGui::Text("Contacts:");
-      for (const auto& n : npcs) {
-        const bool selected = (navTarget.type == NavTargetType::Npc && navTarget.npcId == n.id);
-        std::string label = n.name + " (" + npcRoleName(n.role) + ")";
-        if (ImGui::Selectable((label + "##npc").c_str(), selected)) {
-          navTarget.type = NavTargetType::Npc;
-          navTarget.npcId = n.id;
-        }
-      }
-      ImGui::Separator();
+
       ImGui::Checkbox("Autopilot (P)", &autopilot);
-      ImGui::Checkbox("Supercruise Assist (Z)", &scAssist);
-      ImGui::Checkbox("Fuel Scoop (O)", &scoopEnabled);
-      ImGui::End();
-    }
 
-    // Station services: market / repairs / refuel / upgrades
-    if (showMarket) {
-      ImGui::Begin("Station Services", &showMarket);
-
-      if (!isDocked()) {
-        ImGui::TextColored({1, 0.6f, 0.2f, 1}, "Dock at a station to access services.");
-        ImGui::End();
+      if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+        const auto& st = currentSystem->stations[target.index];
+        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const double dist = (pos - stPos).length();
+        auto it = clearances.find(st.id);
+        bool clearance = (it != clearances.end() && it->second.granted && timeDays <= it->second.expiresDays);
+        ImGui::Separator();
+        ImGui::Text("Target: %s (%.0f km)", st.name.c_str(), dist);
+        ImGui::Text("Clearance: %s", clearance ? "GRANTED" : "NONE");
+        ImGui::TextDisabled("Docking: request clearance (L), fly through slot, then press G.");
       } else {
-        auto stOpt = findStationById(*currentSys, dockedStationId);
-        if (!stOpt) {
-          ImGui::Text("Docked station not found.");
-          ImGui::End();
-        } else {
-          const auto& st = **stOpt;
-          ImGui::Text("%s (%s)", st.name.c_str(), stationTypeName(st.type));
-          ImGui::Text("Fee: %.1f%%", st.feeRate * 100.0);
-
-          auto& econState = universe.stationEconomy(st, save.timeDays);
-
-          if (ImGui::CollapsingHeader("Market", ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (ImGui::BeginTable("market", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-              ImGui::TableSetupColumn("Commodity");
-              ImGui::TableSetupColumn("Inv");
-              ImGui::TableSetupColumn("Bid");
-              ImGui::TableSetupColumn("Ask");
-              ImGui::TableSetupColumn("You");
-              ImGui::TableSetupColumn("Buy");
-              ImGui::TableSetupColumn("Sell");
-              ImGui::TableHeadersRow();
-
-              for (std::size_t i = 0; i < stellar::econ::kCommodityCount; ++i) {
-                const auto id = static_cast<stellar::econ::CommodityId>(i);
-                const auto q = stellar::econ::quote(econState, st.economyModel, id);
-
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                ImGui::TextUnformatted(stellar::econ::commodityName(id).data());
-                ImGui::TableSetColumnIndex(1);
-                ImGui::Text("%.1f", q.inventory);
-                ImGui::TableSetColumnIndex(2);
-                ImGui::Text("%.1f", q.bid);
-                ImGui::TableSetColumnIndex(3);
-                ImGui::Text("%.1f", q.ask);
-                ImGui::TableSetColumnIndex(4);
-                ImGui::Text("%.1f", save.cargo[i]);
-
-                // Buy 1
-                ImGui::TableSetColumnIndex(5);
-                std::string buyId = std::string("Buy##") + std::to_string(i);
-                if (ImGui::SmallButton(buyId.c_str())) {
-                  const double mass = stellar::econ::commodityDef(id).massKg;
-                  if (cargoMassKg(save.cargo) + mass > cargoCapacityKg) {
-                    pushToast(toasts, "Cargo hold full.");
-                  } else {
-                    auto tr = stellar::econ::buy(econState, st.economyModel, id, 1.0, save.credits, 0.10, st.feeRate);
-                    if (!tr.ok) pushToast(toasts, tr.reason ? tr.reason : "Buy failed");
-                    else save.cargo[i] += 1.0;
-                  }
-                }
-
-                // Sell 1
-                ImGui::TableSetColumnIndex(6);
-                std::string sellId = std::string("Sell##") + std::to_string(i);
-                if (ImGui::SmallButton(sellId.c_str())) {
-                  if (save.cargo[i] < 1.0) {
-                    pushToast(toasts, "You don't have that cargo.");
-                  } else {
-                    auto tr = stellar::econ::sell(econState, st.economyModel, id, 1.0, save.credits, 0.10, st.feeRate);
-                    if (!tr.ok) pushToast(toasts, tr.reason ? tr.reason : "Sell failed");
-                    else save.cargo[i] -= 1.0;
-                  }
-                }
-              }
-
-              ImGui::EndTable();
-            }
-          }
-
-          if (ImGui::CollapsingHeader("Refuel & Repairs", ImGuiTreeNodeFlags_DefaultOpen)) {
-            // Refuel uses station Fuel inventory.
-            const auto fuelQuote = stellar::econ::quote(econState, st.economyModel, stellar::econ::CommodityId::Fuel);
-            const double need = std::max(0.0, fuelMax - fuel);
-            const double maxBuy = std::min(need, fuelQuote.inventory);
-
-            ImGui::Text("Fuel price: ask %.1f  (station inv %.1f)", fuelQuote.ask, fuelQuote.inventory);
-            if (ImGui::Button("Refuel 5 units")) {
-              const double amount = std::min(5.0, maxBuy);
-              if (amount <= 0.0) {
-                pushToast(toasts, "No fuel available.");
-              } else {
-                double credits = save.credits;
-                auto tr = stellar::econ::buy(econState, st.economyModel, stellar::econ::CommodityId::Fuel, amount, credits, 0.10, st.feeRate);
-                if (!tr.ok) pushToast(toasts, tr.reason ? tr.reason : "Refuel failed");
-                else {
-                  save.credits = credits;
-                  fuel = std::min(fuelMax, fuel + amount);
-                  pushToast(toasts, "Refueled.");
-                }
-              }
-            }
-
-            // Repairs consume Metals from station to gate repair capability.
-            const auto metQuote = stellar::econ::quote(econState, st.economyModel, stellar::econ::CommodityId::Metals);
-            const double missing = std::max(0.0, 1.0 - hull);
-            const double metalPerHull = 6.0; // units per 100% hull
-            const double needMetal = missing * metalPerHull;
-            const double canMetal = std::min(needMetal, metQuote.inventory);
-
-            ImGui::Text("Metals inv: %.1f (repair needs %.1f)", metQuote.inventory, needMetal);
-            if (ImGui::Button("Repair 10%")) {
-              const double wantHull = 0.10;
-              const double needM = wantHull * metalPerHull;
-              if (hull >= 0.999) {
-                pushToast(toasts, "Hull already full.");
-              } else if (metQuote.inventory < needM) {
-                pushToast(toasts, "Not enough Metals for repairs.");
-              } else {
-                // Consume metals.
-                double dummyCredits = 1e12;
-                auto tr = stellar::econ::buy(econState, st.economyModel, stellar::econ::CommodityId::Metals, needM, dummyCredits, 0.0, st.feeRate);
-                if (!tr.ok) {
-                  pushToast(toasts, "Repair inventory error.");
-                } else {
-                  const double cost = 120.0 * wantHull * (1.0 + st.feeRate * 2.0);
-                  if (save.credits < cost) {
-                    // Refund metals if player can't pay
-                    (void)stellar::econ::sell(econState, st.economyModel, stellar::econ::CommodityId::Metals, needM, dummyCredits, 0.0, st.feeRate);
-                    pushToast(toasts, "Insufficient credits.");
-                  } else {
-                    save.credits -= cost;
-                    hull = std::min(1.0, hull + wantHull);
-                    pushToast(toasts, "Repaired hull.");
-                  }
-                }
-              }
-            }
-          }
-
-          if (ImGui::CollapsingHeader("Upgrades")) {
-            ImGui::Text("(Early placeholder upgrade loop)");
-
-            // Upgrades are now lightly gated by station inventory so scarcity matters.
-            {
-              const double cost = 650.0 * (1.0 + st.feeRate);
-              const double parts = 6.0;
-              const auto partId = stellar::econ::CommodityId::Machinery;
-              const auto q = stellar::econ::quote(econState, st.economyModel, partId);
-
-              ImGui::Text("Cargo racks require %.0f x Machinery (inv %.1f)", parts, q.inventory);
-              if (ImGui::Button("Buy cargo racks (+80 kg)")) {
-                if (save.credits < cost) {
-                  pushToast(toasts, "Not enough credits.");
-                } else if (q.inventory < parts) {
-                  pushToast(toasts, "Station lacks Machinery parts.");
-                } else {
-                  double dummyCredits = 1e12;
-                  auto tr = stellar::econ::buy(econState, st.economyModel, partId, parts, dummyCredits, 0.0, st.feeRate);
-                  if (!tr.ok) {
-                    pushToast(toasts, "Upgrade failed (inventory).");
-                  } else {
-                    save.credits -= cost;
-                    cargoCapacityKg += 80.0;
-                    pushToast(toasts, "Cargo capacity upgraded.");
-                  }
-                }
-              }
-            }
-
-            {
-              const double cost = 550.0 * (1.0 + st.feeRate);
-              const double parts = 5.0;
-              const auto partId = stellar::econ::CommodityId::Metals;
-              const auto q = stellar::econ::quote(econState, st.economyModel, partId);
-              ImGui::Text("Aux tank requires %.0f x Metals (inv %.1f)", parts, q.inventory);
-
-              if (ImGui::Button("Buy auxiliary tank (+20 fuel)")) {
-                if (save.credits < cost) {
-                  pushToast(toasts, "Not enough credits.");
-                } else if (q.inventory < parts) {
-                  pushToast(toasts, "Station lacks Metals parts.");
-                } else {
-                  double dummyCredits = 1e12;
-                  auto tr = stellar::econ::buy(econState, st.economyModel, partId, parts, dummyCredits, 0.0, st.feeRate);
-                  if (!tr.ok) {
-                    pushToast(toasts, "Upgrade failed (inventory).");
-                  } else {
-                    save.credits -= cost;
-                    fuelMax += 20.0;
-                    fuel = std::min(fuelMax, fuel + 10.0);
-                    pushToast(toasts, "Fuel tank upgraded.");
-                  }
-                }
-              }
-            }
-          }
-
-          ImGui::End();
-        }
-      }
-    }
-
-    // Missions panel
-    if (showMissions) {
-      ImGui::Begin("Missions", &showMissions);
-
-      if (!isDocked()) {
-        ImGui::TextColored({1, 0.6f, 0.2f, 1}, "Dock to pick up missions.");
-      } else {
-        auto stOpt = findStationById(*currentSys, dockedStationId);
-        if (stOpt) {
-          const auto& st = **stOpt;
-          const std::uint64_t dayKey = static_cast<std::uint64_t>(std::floor(save.timeDays));
-          if (boardStationId != st.id || boardDayKey != dayKey) {
-            boardStationId = st.id;
-            boardDayKey = dayKey;
-            boardMissions = generateMissionBoard(currentStub, *currentSys, st, universe, save.timeDays, 6, 35.0);
-          }
-
-          ImGui::Text("Available:");
-          for (std::size_t i = 0; i < boardMissions.size(); ++i) {
-            auto& m = boardMissions[i];
-
-            // Gate delivery missions by stock.
-            bool canAccept = true;
-            if (m.type == stellar::sim::MissionType::Delivery && m.cargoProvided) {
-              auto& econState = universe.stationEconomy(st, save.timeDays);
-              const double inv = econState.inventory[static_cast<std::size_t>(m.commodity)];
-              if (inv < m.units) canAccept = false;
-              if (cargoMassKg(save.cargo) + m.units * stellar::econ::commodityDef(m.commodity).massKg > cargoCapacityKg) canAccept = false;
-            }
-
-            ImGui::Separator();
-            ImGui::Text("%s -> station %llu", missionTypeName(m.type), static_cast<unsigned long long>(m.toStation));
-            if (m.type == stellar::sim::MissionType::Delivery) {
-              ImGui::Text("Cargo: %.0f x %s", m.units, stellar::econ::commodityName(m.commodity).data());
-            }
-            ImGui::Text("Reward: %.0f   Deadline: day %.1f", m.reward, m.deadlineDay);
-
-            ImGui::BeginDisabled(!canAccept);
-            std::string btn = std::string("Accept##") + std::to_string(i);
-            if (ImGui::Button(btn.c_str())) {
-              stellar::sim::Mission a = m;
-              a.id = nextMissionId++;
-
-              if (a.type == stellar::sim::MissionType::Delivery && a.cargoProvided) {
-                // Load cargo from station inventory right now.
-                auto& econState = universe.stationEconomy(st, save.timeDays);
-                double dummyCredits = 1e12;
-                auto tr = stellar::econ::buy(econState, st.economyModel, a.commodity, a.units, dummyCredits, 0.0, st.feeRate);
-                if (!tr.ok) {
-                  pushToast(toasts, "Mission cargo unavailable.");
-                } else {
-                  save.cargo[static_cast<std::size_t>(a.commodity)] += a.units;
-                  pushToast(toasts, "Mission accepted: delivery cargo loaded.");
-                  activeMissions.push_back(std::move(a));
-                }
-              } else if (a.type == stellar::sim::MissionType::BountyScan) {
-                // Spawn a deterministic target id.
-                a.targetNpcId = stellar::core::hashCombine(a.id, 0xB00B1EULL);
-
-                // Place the target in the destination system on arrival.
-                // For now we spawn it immediately if target is current system.
-                if (a.toSystem == save.currentSystem) {
-                  NpcShip tgt{};
-                  tgt.id = a.targetNpcId;
-                  tgt.role = NpcRole::Pirate;
-                  tgt.name = "Wanted " + makeNpcName(tgt.id, NpcRole::Pirate);
-                  tgt.state = NpcState::Loiter;
-                  tgt.posKm = ship.positionKm() + stellar::math::Vec3d{1200.0, 0.0, 1200.0};
-                  npcs.push_back(std::move(tgt));
-                }
-
-                pushToast(toasts, "Mission accepted: bounty scan.");
-                activeMissions.push_back(std::move(a));
-              } else {
-                pushToast(toasts, "Mission accepted.");
-                activeMissions.push_back(std::move(a));
-              }
-            }
-            ImGui::EndDisabled();
-            if (!canAccept) {
-              ImGui::TextColored({1, 0.5f, 0.3f, 1}, "Unavailable (scarcity or cargo capacity).");
-            }
-          }
-        }
+        ImGui::TextDisabled("Target: (none)  [T cycles stations]");
       }
 
       ImGui::Separator();
-      ImGui::Text("Active:");
-      for (auto& m : activeMissions) {
-        if (m.failed) {
-          ImGui::TextColored({1, 0.3f, 0.3f, 1}, "FAILED: %s (id %llu)", missionTypeName(m.type), static_cast<unsigned long long>(m.id));
-        } else if (m.completed) {
-          ImGui::TextColored({0.3f, 1, 0.4f, 1}, "DONE: %s (id %llu)", missionTypeName(m.type), static_cast<unsigned long long>(m.id));
-        } else {
-          ImGui::Text("%s (id %llu) -> station %llu (deadline %.1f)",
-                      missionTypeName(m.type),
-                      static_cast<unsigned long long>(m.id),
-                      static_cast<unsigned long long>(m.toStation),
-                      m.deadlineDay);
-        }
-      }
+      ImGui::Text("Pos (km):   [%.1f %.1f %.1f]", pos.x, pos.y, pos.z);
+      ImGui::Text("Vel (km/s): [%.3f %.3f %.3f] |v|=%.3f", vel.x, vel.y, vel.z, vel.length());
+      ImGui::Text("AngVel (rad/s): [%.3f %.3f %.3f]", wv.x, wv.y, wv.z);
+
+      ImGui::TextDisabled("Controls:");
+      ImGui::BulletText("Translate: WASD + R/F (up/down)");
+      ImGui::BulletText("Rotate: Arrow keys + Q/E roll");
+      ImGui::BulletText("Boost: LShift   Brake: X");
+      ImGui::BulletText("Dampers: Z (on) / C (off)");
+      ImGui::BulletText("Target: T (cycle stations), Y (clear)");
+      ImGui::BulletText("Docking: L (request clearance), G (dock/undock)");
+      ImGui::BulletText("Fire: Left Mouse");
+      ImGui::BulletText("Pause: Space   Save: F5   Load: F9");
 
       ImGui::End();
     }
 
-    // Galaxy map / FSD jump
-    if (showGalaxy) {
-      ImGui::Begin("Galaxy Map", &showGalaxy);
+    if (showEconomy) {
+      beginStationSelectorHUD(*currentSystem, selectedStationIndex, docked, dockedStationId);
 
-      ImGui::Text("Jump range: %.1f ly (fuel %.1f, cost/ly %.2f)", maxJumpRangeLy(), fuel, jumpFuelPerLy());
-      const bool fsdReady = (save.timeDays >= fsdReadyDay);
-      if (!fsdReady) {
-        ImGui::TextColored({1, 0.6f, 0.2f, 1}, "FSD cooldown... ready at day %.2f", fsdReadyDay);
-      }
+      if (!currentSystem->stations.empty()) {
+        const auto& station = currentSystem->stations[(std::size_t)selectedStationIndex];
+        auto& stEcon = universe.stationEconomy(station, timeDays);
 
-      // Nearby systems around current.
-      auto sysList = universe.queryNearby(currentStub.posLy, 60.0, 64);
-      if (sysList.empty()) {
-        ImGui::Text("No nearby systems.");
-      } else {
-        if (ImGui::BeginTable("gal", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, {0, 300})) {
-          ImGui::TableSetupColumn("Name");
-          ImGui::TableSetupColumn("Dist (ly)");
-          ImGui::TableSetupColumn("Planets");
-          ImGui::TableSetupColumn("Stations");
+        ImGui::Begin("Market Details");
+        ImGui::Text("Credits: %.2f", credits);
+
+        const bool canTrade = docked && (station.id == dockedStationId);
+        if (!canTrade) {
+          ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.35f, 1.0f), "Trade disabled: dock at this station to buy/sell.");
+        }
+
+        // Simple docked services
+        if (canTrade) {
+          if (ImGui::Button("Repair hull (500 cr)")) {
+            if (credits >= 500.0) {
+              credits -= 500.0;
+              playerHull = 100.0;
+              toast(toasts, "Ship repaired.", 2.0);
+            } else {
+              toast(toasts, "Not enough credits.", 2.0);
+            }
+          }
+        }
+
+        static int selectedCommodity = 0;
+        ImGui::SliderInt("Plot commodity", &selectedCommodity, 0, (int)econ::kCommodityCount - 1);
+
+        // Table
+        if (ImGui::BeginTable("market", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+          ImGui::TableSetupColumn("Commodity");
+          ImGui::TableSetupColumn("Inv");
+          ImGui::TableSetupColumn("Ask");
+          ImGui::TableSetupColumn("Bid");
+          ImGui::TableSetupColumn("Cargo");
+          ImGui::TableSetupColumn("Trade");
           ImGui::TableHeadersRow();
 
-          for (const auto& s : sysList) {
-            if (s.id == currentStub.id) continue;
-            const double distLy = (s.posLy - currentStub.posLy).length();
-            const bool inRange = distLy <= maxJumpRangeLy();
+          for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+            const auto cid = (econ::CommodityId)i;
+            const auto q = econ::quote(stEcon, station.economyModel, cid, 0.10);
 
             ImGui::TableNextRow();
+
             ImGui::TableSetColumnIndex(0);
-            const bool selected = (galaxySelectedSystem == s.id);
-            ImGui::BeginDisabled(!inRange);
-            if (ImGui::Selectable((s.name + "##sys").c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
-              galaxySelectedSystem = s.id;
+            ImGui::Text("%s", std::string(econ::commodityName(cid)).c_str());
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%.0f", q.inventory);
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("%.2f", q.ask);
+
+            ImGui::TableSetColumnIndex(3);
+            ImGui::Text("%.2f", q.bid);
+
+            ImGui::TableSetColumnIndex(4);
+            ImGui::Text("%.0f", cargo[i]);
+
+            ImGui::TableSetColumnIndex(5);
+            ImGui::PushID((int)i);
+
+            static float qty[ (int)econ::kCommodityCount ] = {};
+            if (qty[i] <= 0.0f) qty[i] = 10.0f;
+            ImGui::SetNextItemWidth(70);
+            ImGui::InputFloat("##qty", &qty[i], 1.0f, 10.0f, "%.0f");
+
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!canTrade);
+            if (ImGui::SmallButton("Buy")) {
+              auto tr = econ::buy(stEcon, station.economyModel, cid, qty[i], credits, 0.10, station.feeRate);
+              if (tr.ok) cargo[i] += qty[i];
+            }
+
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Sell")) {
+              const double sellUnits = std::min<double>(qty[i], cargo[i]);
+              if (sellUnits > 0.0) {
+                auto tr = econ::sell(stEcon, station.economyModel, cid, sellUnits, credits, 0.10, station.feeRate);
+                if (tr.ok) cargo[i] -= sellUnits;
+              }
             }
             ImGui::EndDisabled();
-            ImGui::TableSetColumnIndex(1);
-            ImGui::Text("%.1f", distLy);
-            ImGui::TableSetColumnIndex(2);
-            ImGui::Text("%d", s.planetCount);
-            ImGui::TableSetColumnIndex(3);
-            ImGui::Text("%d", s.stationCount);
+
+            ImGui::PopID();
           }
 
           ImGui::EndTable();
         }
 
-        if (galaxySelectedSystem != 0) {
-          auto dstStubOpt = [&]() -> std::optional<stellar::sim::SystemStub> {
-            for (const auto& s : sysList) if (s.id == galaxySelectedSystem) return s;
-            return std::nullopt;
-          }();
+        // Price history plot for selected commodity
+        const std::size_t cidx = (std::size_t)selectedCommodity;
+        const auto& hist = stEcon.history[cidx];
+        if (!hist.empty()) {
+          std::vector<float> vals;
+          vals.reserve(hist.size());
+          for (const auto& p : hist) vals.push_back((float)p.price);
 
-          if (dstStubOpt) {
-            const double distLy = (dstStubOpt->posLy - currentStub.posLy).length();
-            const double fuelNeed = distLy * jumpFuelPerLy();
-
-            ImGui::Separator();
-            ImGui::Text("Selected: %s (%.1f ly)", dstStubOpt->name.c_str(), distLy);
-            ImGui::Text("Fuel needed: %.1f", fuelNeed);
-
-            ImGui::BeginDisabled(!(isDocked() && fsdReady && distLy <= maxJumpRangeLy() && fuel >= fuelNeed));
-            if (ImGui::Button("Hyperspace Jump")) {
-              fuel -= fuelNeed;
-              fsdReadyDay = save.timeDays + (3.0 / 1440.0); // 3 min cooldown
-
-              // Simple "jump" (no animation yet).
-              arriveInSystemNearStation(dstStubOpt->id, *dstStubOpt);
-
-              // If any bounty mission targets the destination, spawn its target contact.
-              for (const auto& m : activeMissions) {
-                if (m.type == stellar::sim::MissionType::BountyScan && !m.completed && !m.failed && m.toSystem == dstStubOpt->id && m.targetNpcId != 0) {
-                  NpcShip tgt{};
-                  tgt.id = m.targetNpcId;
-                  tgt.role = NpcRole::Pirate;
-                  tgt.name = "Wanted " + makeNpcName(tgt.id, NpcRole::Pirate);
-                  tgt.state = NpcState::Loiter;
-                  tgt.posKm = ship.positionKm() + stellar::math::Vec3d{1500.0, 0.0, 1000.0};
-                  npcs.push_back(std::move(tgt));
-                }
-              }
-
-              pushToast(toasts, "FSD jump complete.");
-            }
-            ImGui::EndDisabled();
-
-            if (!isDocked()) {
-              ImGui::TextColored({1, 0.6f, 0.2f, 1}, "(Dock to jump)" );
-            }
-          }
+          ImGui::PlotLines("Price history", vals.data(), (int)vals.size(), 0, nullptr, 0.0f, 0.0f, ImVec2(0, 120));
+        } else {
+          ImGui::TextDisabled("No history yet (time needs to advance).");
         }
+
+        ImGui::End();
+      }
+    }
+
+    if (showContacts) {
+      ImGui::Begin("Contacts / Combat");
+
+      int alivePirates = 0;
+      for (const auto& c : contacts) if (c.alive && c.pirate) ++alivePirates;
+      ImGui::Text("Alive pirates: %d", alivePirates);
+
+      if (ImGui::Button("Panic: clear pirates")) {
+        for (auto& c : contacts) c.alive = false;
+        toast(toasts, "Contacts cleared.", 2.0);
+      }
+
+      ImGui::Separator();
+
+      for (std::size_t i = 0; i < contacts.size(); ++i) {
+        const auto& c = contacts[i];
+        if (!c.alive) continue;
+
+        ImGui::PushID((int)i);
+        ImGui::Text("%s %s", c.name.c_str(), c.pirate ? "[PIRATE]" : "");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Target")) {
+          target.kind = TargetKind::Contact;
+          target.index = i;
+        }
+        ImGui::TextDisabled("Hull %.0f  Shield %.0f", c.hull, c.shield);
+        ImGui::PopID();
       }
 
       ImGui::End();
     }
 
-    // Simple on-screen marker for current target
-    if (navTarget.type != NavTargetType::None) {
-      if (auto tPos = targetWorldPosKm()) {
-        bool behind = false;
-        const ImVec2 pt = worldToScreen(view, proj, (*tPos) * worldScale, vpSize, &behind);
-        if (!behind && pt.x >= -100 && pt.x <= vpSize.x + 100 && pt.y >= -100 && pt.y <= vpSize.y + 100) {
-          auto* dl = ImGui::GetForegroundDrawList();
-          dl->AddCircle(pt, 8.0f, IM_COL32(255, 220, 80, 220), 16, 2.0f);
-          dl->AddText({pt.x + 10.0f, pt.y - 10.0f}, IM_COL32(255, 220, 80, 220), targetName().c_str());
+    if (showGalaxy) {
+      ImGui::Begin("Galaxy / Streaming");
+
+      const auto center = currentSystem->stub.posLy;
+      static float radius = 200.0f;
+      ImGui::SliderFloat("Query radius (ly)", &radius, 20.0f, 1200.0f);
+
+      auto nearby = universe.queryNearby(center, radius, 128);
+
+      ImGui::Text("Nearby systems: %d", (int)nearby.size());
+
+      // Mini-map canvas
+      const ImVec2 canvasSize = ImVec2(420, 420);
+      ImGui::BeginChild("map", canvasSize, true, ImGuiWindowFlags_NoScrollbar);
+
+      ImDrawList* draw = ImGui::GetWindowDrawList();
+      const ImVec2 p0 = ImGui::GetCursorScreenPos();
+      const ImVec2 p1 = ImVec2(p0.x + canvasSize.x, p0.y + canvasSize.y);
+      const ImVec2 centerPx = ImVec2((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
+
+      // Background
+      draw->AddRectFilled(p0, p1, IM_COL32(10, 10, 14, 255));
+      draw->AddRect(p0, p1, IM_COL32(80, 80, 95, 255));
+
+      auto toPx = [&](const math::Vec3d& posLy) -> ImVec2 {
+        const math::Vec3d d = posLy - center;
+        const float sx = (float)(d.x / (double)radius) * (canvasSize.x * 0.5f);
+        const float sy = (float)(d.y / (double)radius) * (canvasSize.y * 0.5f);
+        return ImVec2(centerPx.x + sx, centerPx.y + sy);
+      };
+
+      // Star lanes: connect each system to 3 nearest neighbors in XY
+      const int k = 3;
+      for (std::size_t i = 0; i < nearby.size(); ++i) {
+        struct N { std::size_t j; double d2; };
+        std::vector<N> ns;
+        ns.reserve(nearby.size());
+        for (std::size_t j = 0; j < nearby.size(); ++j) if (j != i) {
+          const auto di = nearby[j].posLy - nearby[i].posLy;
+          const double d2 = di.x*di.x + di.y*di.y + di.z*di.z;
+          ns.push_back({j, d2});
+        }
+        std::sort(ns.begin(), ns.end(), [](const N& a, const N& b){ return a.d2 < b.d2; });
+        const int count = std::min<int>(k, (int)ns.size());
+
+        const ImVec2 a = toPx(nearby[i].posLy);
+        for (int n = 0; n < count; ++n) {
+          const ImVec2 b = toPx(nearby[ns[n].j].posLy);
+          draw->AddLine(a, b, IM_COL32(50, 80, 120, 100), 1.0f);
         }
       }
+
+      // Systems
+      static sim::SystemId selected = 0;
+      for (const auto& s : nearby) {
+        const ImVec2 p = toPx(s.posLy);
+        const bool isCurrent = (s.id == currentSystem->stub.id);
+        const bool isSel = (s.id == selected);
+
+        ImU32 col = isCurrent ? IM_COL32(255, 240, 160, 255) : IM_COL32(170, 170, 190, 255);
+        if (s.factionId != 0) col = IM_COL32(160, 220, 170, 255);
+        if (isSel) col = IM_COL32(255, 120, 120, 255);
+
+        draw->AddCircleFilled(p, isCurrent ? 5.5f : 4.0f, col);
+
+        // Click detection
+        const float rClick = 6.0f;
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+          const ImVec2 mp = ImGui::GetIO().MousePos;
+          const float dx = mp.x - p.x;
+          const float dy = mp.y - p.y;
+          if (dx*dx + dy*dy <= rClick*rClick) selected = s.id;
+        }
+      }
+
+      ImGui::EndChild();
+
+      if (selected != 0 && selected != currentSystem->stub.id) {
+        if (ImGui::Button("Jump to selected system")) {
+          auto it = std::find_if(nearby.begin(), nearby.end(), [&](const sim::SystemStub& s){ return s.id == selected; });
+          if (it != nearby.end()) {
+            currentStub = *it;
+            const auto& sys = universe.getSystem(currentStub.id, &currentStub);
+            currentSystem = &sys;
+
+            // Clear transient state on jump
+            contacts.clear();
+            clearances.clear();
+            docked = false;
+            dockedStationId = 0;
+            autopilot = false;
+            target = Target{};
+            nextPirateSpawnDays = timeDays + 0.02;
+
+            // spawn near first station
+            respawnNearStation(*currentSystem, 0);
+
+            toast(toasts, "Arrived in " + currentSystem->stub.name, 2.5);
+          }
+        }
+      }
+
+      ImGui::TextDisabled("TAB toggles this window, F1 Flight, F2 Market, F3 Contacts");
+
+      ImGui::End();
     }
 
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
     SDL_GL_SwapWindow(window);
-
-    // Autosave
-    static double saveTimer = 0.0;
-    saveTimer += dt;
-    if (saveTimer > 2.0) {
-      saveTimer = 0.0;
-      (void)stellar::sim::saveToFile(save, kSavePath);
-    }
   }
 
-  // Final save
-  (void)stellar::sim::saveToFile(save, kSavePath);
-
-  // Shutdown
+  // Cleanup
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplSDL2_Shutdown();
   ImGui::DestroyContext();
 
-  SDL_GL_DeleteContext(gl_ctx);
+  SDL_GL_DeleteContext(glContext);
   SDL_DestroyWindow(window);
   SDL_Quit();
 
