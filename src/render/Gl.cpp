@@ -95,11 +95,19 @@ bool load() {
   DrawElementsInstanced = loadProc<PFNGLDRAWELEMENTSINSTANCEDPROC>("glDrawElementsInstanced");
 
   ActiveTexture = loadProc<PFNGLACTIVETEXTUREPROC>("glActiveTexture");
+  if (!ActiveTexture) {
+    // Some drivers expose this via ARB extension entry points.
+    ActiveTexture = loadProc<PFNGLACTIVETEXTUREPROC>("glActiveTextureARB");
+  }
   GenTextures = loadProc<PFNGLGENTEXTURESPROC>("glGenTextures");
   BindTexture = loadProc<PFNGLBINDTEXTUREPROC>("glBindTexture");
   TexImage2D = loadProc<PFNGLTEXIMAGE2DPROC>("glTexImage2D");
   TexParameteri = loadProc<PFNGLTEXPARAMETERIPROC>("glTexParameteri");
   GenerateMipmap = loadProc<PFNGLGENERATEMIPMAPPROC>("glGenerateMipmap");
+  if (!GenerateMipmap) {
+    // Some older drivers expose mipmap generation as an extension entry point.
+    GenerateMipmap = loadProc<PFNGLGENERATEMIPMAPPROC>("glGenerateMipmapEXT");
+  }
   DeleteTextures = loadProc<PFNGLDELETETEXTURESPROC>("glDeleteTextures");
 
   // Fallback for entry points that may be exported directly by the OpenGL library
@@ -109,8 +117,11 @@ bool load() {
   if (!TexImage2D)    TexImage2D    = reinterpret_cast<PFNGLTEXIMAGE2DPROC>(&::glTexImage2D);
   if (!TexParameteri) TexParameteri = reinterpret_cast<PFNGLTEXPARAMETERIPROC>(&::glTexParameteri);
   if (!DeleteTextures)DeleteTextures= reinterpret_cast<PFNGLDELETETEXTURESPROC>(&::glDeleteTextures);
-  if (!ActiveTexture) ActiveTexture = reinterpret_cast<PFNGLACTIVETEXTUREPROC>(&::glActiveTexture);
-  if (!GenerateMipmap)GenerateMipmap= reinterpret_cast<PFNGLGENERATEMIPMAPPROC>(&::glGenerateMipmap);
+
+  // Note: Do NOT fall back to &::glActiveTexture or &::glGenerateMipmap on Windows.
+  // The system OpenGL import library (opengl32.dll) only guarantees prototypes/exports for
+  // OpenGL 1.1, so referencing these symbols can fail to compile even if the runtime supports
+  // them. These must be loaded via SDL_GL_GetProcAddress.
 
   const bool ok =
       CreateShader && ShaderSource && CompileShader && GetShaderiv && GetShaderInfoLog && DeleteShader &&

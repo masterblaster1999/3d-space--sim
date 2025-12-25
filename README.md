@@ -42,7 +42,7 @@ This repo contains:
 ## Controls (quick)
 - Translate: **W/S** (forward/back), **A/D** (strafe), **R/F** (up/down)
 - Rotate: **Arrow keys** (pitch/yaw), **Q/E** (roll)
-- Mouse steering: **Hold Right Mouse** + move mouse (pitch/yaw)
+- Mouse steering: **M** toggles Mouse Steer mode (captures cursor); move mouse (pitch/yaw)
 - Boost: **LShift**   Brake: **X**
 - Dampers: **Z** on / **C** off
 - Targets: **T** station, **B** planet, **N** contact, **U** star | clear target: **Y**

@@ -734,6 +734,11 @@ int main(int argc, char** argv) {
   bool showContacts = true;
   bool showScanner = true;
 
+  // Optional mouse steering (relative mouse mode). Toggle with M.
+  bool mouseSteer = false;
+  float mouseSensitivity = 0.0025f; // torque intent per pixel
+  bool mouseInvertY = false;
+
   // Flight assistance
   bool autopilot = false;
   int autopilotPhase = 0; // 0=staging, 1=corridor
@@ -1009,6 +1014,21 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     const double dtReal = std::chrono::duration<double>(now - last).count();
     last = now;
 
+    // Keep relative mouse mode in sync with our control mode.
+    // (Automatically release the mouse when docked so UI interaction is painless.)
+    if (docked && mouseSteer) {
+      mouseSteer = false;
+      SDL_SetRelativeMouseMode(SDL_FALSE);
+      SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+      toast(toasts, "Mouse steer disabled while docked.", 2.0);
+    }
+
+    const SDL_bool wantRelMouse = mouseSteer ? SDL_TRUE : SDL_FALSE;
+    if (SDL_GetRelativeMouseMode() != wantRelMouse) {
+      SDL_SetRelativeMouseMode(wantRelMouse);
+      SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+    }
+
 
     // Per-frame helper: apply damage from the player to a contact (laser / cannon / projectiles).
     auto playerDamageContact = [&](int idx, double dmg) {
@@ -1228,8 +1248,17 @@ policeAlertUntilDays = 0.0;
           autopilotPhase = 0;
         }
 
+        if (event.key.keysym.sym == SDLK_m) {
+          if (!io.WantCaptureKeyboard) {
+            mouseSteer = !mouseSteer;
+            SDL_SetRelativeMouseMode(mouseSteer ? SDL_TRUE : SDL_FALSE);
+            SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+            toast(toasts, std::string("Mouse steer ") + (mouseSteer ? "ON" : "OFF") + " (M)", 1.8);
+          }
+        }
+
         if (event.key.keysym.sym == SDLK_h) {
-          if (!captureKeys && !docked && fsdState == FsdState::Idle) {
+          if (!io.WantCaptureKeyboard && !docked && fsdState == FsdState::Idle) {
             // Interdiction-lite: if pirates are nearby, block *engage* and force emergency drops while active.
             double nearestPirateKm = 1e99;
             for (const auto& c : contacts) {
@@ -1649,6 +1678,17 @@ if (bestIdx >= 0) {
 
       input.torqueLocal.z += (keys[SDL_SCANCODE_E] ? 1.0 : 0.0);
       input.torqueLocal.z -= (keys[SDL_SCANCODE_Q] ? 1.0 : 0.0);
+
+      // Mouse steering (relative mode). Uses local pitch/yaw.
+      if (mouseSteer && !io.WantCaptureMouse) {
+        int dx = 0, dy = 0;
+        SDL_GetRelativeMouseState(&dx, &dy);
+        const double sx = (double)mouseSensitivity;
+        const double yaw = (double)dx * sx;
+        const double pitch = (double)(mouseInvertY ? dy : -dy) * sx;
+        input.torqueLocal.y += yaw;
+        input.torqueLocal.x += pitch;
+      }
 
       input.boost = keys[SDL_SCANCODE_LSHIFT] != 0;
       input.brake = keys[SDL_SCANCODE_X] != 0;
@@ -3214,6 +3254,13 @@ if (showShip) {
 
   ImGui::Text("Ship pos: (%.0f,%.0f,%.0f) km", ship.positionKm().x, ship.positionKm().y, ship.positionKm().z);
   ImGui::Text("Vel: %.3f km/s", ship.velocityKmS().length());
+
+  ImGui::Separator();
+  ImGui::Text("Controls");
+  ImGui::Checkbox("Mouse steer (M)", &mouseSteer);
+  ImGui::Checkbox("Invert mouse Y", &mouseInvertY);
+  ImGui::SliderFloat("Mouse sensitivity", &mouseSensitivity, 0.0006f, 0.0080f, "%.4f");
+  ImGui::TextDisabled("Mouse steer captures the cursor (relative mouse mode).");
 
   if (scanning) {
     ImGui::Separator();
