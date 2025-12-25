@@ -102,22 +102,21 @@ bool load() {
   GenerateMipmap = loadProc<PFNGLGENERATEMIPMAPPROC>("glGenerateMipmap");
   DeleteTextures = loadProc<PFNGLDELETETEXTURESPROC>("glDeleteTextures");
 
-  // On some platforms (notably Windows), GL 1.1 core functions may not be
-  // returned by wglGetProcAddress. SDL_GL_GetProcAddress usually handles this,
-  // but we defensively fall back to the statically linked symbols.
-  if (!GenTextures) GenTextures = reinterpret_cast<PFNGLGENTEXTURESPROC>(&::glGenTextures);
-  if (!BindTexture) BindTexture = reinterpret_cast<PFNGLBINDTEXTUREPROC>(&::glBindTexture);
-  if (!TexImage2D) TexImage2D = reinterpret_cast<PFNGLTEXIMAGE2DPROC>(&::glTexImage2D);
-  if (!TexParameteri) TexParameteri = reinterpret_cast<PFNGLTEXPARAMETERIPROC>(&::glTexParameteri);
+  // On some platforms (notably Windows), SDL_GL_GetProcAddress may return null
+  // for core OpenGL 1.1 entry points. Those are still available via the
+  // statically linked symbols from the system OpenGL library.
+  if (!GenTextures)    GenTextures    = reinterpret_cast<PFNGLGENTEXTURESPROC>(&::glGenTextures);
+  if (!BindTexture)    BindTexture    = reinterpret_cast<PFNGLBINDTEXTUREPROC>(&::glBindTexture);
+  if (!TexImage2D)     TexImage2D     = reinterpret_cast<PFNGLTEXIMAGE2DPROC>(&::glTexImage2D);
+  if (!TexParameteri)  TexParameteri  = reinterpret_cast<PFNGLTEXPARAMETERIPROC>(&::glTexParameteri);
   if (!DeleteTextures) DeleteTextures = reinterpret_cast<PFNGLDELETETEXTURESPROC>(&::glDeleteTextures);
 
   const bool ok =
-      CreateShader && ShaderSource && CompileShader && GetShaderiv && GetShaderInfoLog && DeleteShader &&
-      CreateProgram && AttachShader && LinkProgram && GetProgramiv && GetProgramInfoLog && UseProgram && DeleteProgram &&
-      GetUniformLocation && Uniform1i && Uniform1f && Uniform3f && UniformMatrix4fv &&
-      GenVertexArrays && BindVertexArray && DeleteVertexArrays &&
-      GenBuffers && BindBuffer && BufferData && DeleteBuffers &&
-      EnableVertexAttribArray && VertexAttribPointer && VertexAttribDivisor &&
+      CreateShader && ShaderSource && CompileShader && GetShaderiv && GetShaderInfoLog &&
+      CreateProgram && AttachShader && LinkProgram && GetProgramiv && GetProgramInfoLog && UseProgram &&
+      GenVertexArrays && BindVertexArray &&
+      GenBuffers && BindBuffer && BufferData &&
+      EnableVertexAttribArray && VertexAttribPointer &&
       DrawElementsInstanced &&
       ActiveTexture && GenTextures && BindTexture && TexImage2D && TexParameteri &&
       GenerateMipmap && DeleteTextures;

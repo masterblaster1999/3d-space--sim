@@ -42,6 +42,7 @@ This repo contains:
 ## Controls (quick)
 - Translate: **W/S** (forward/back), **A/D** (strafe), **R/F** (up/down)
 - Rotate: **Arrow keys** (pitch/yaw), **Q/E** (roll)
+- Mouse steering: **Hold Right Mouse** + move mouse (pitch/yaw)
 - Boost: **LShift**   Brake: **X**
 - Dampers: **Z** on / **C** off
 - Targets: **T** station, **B** planet, **N** contact, **U** star | clear target: **Y**
@@ -53,6 +54,7 @@ This repo contains:
 - UI: **TAB** Galaxy, **F1** Flight, **F2** Market, **F3** Contacts, **F4** Missions, **F6** Scanner
 - Save/Load: **F5 / F9**
 - Pause: **Space**
+- Time scale: **[ / ]** cycle simulation speed
 
 ## Build
 
@@ -82,7 +84,7 @@ Some CI templates run `./configure && make`. This repo now includes a **compat**
 - `tests` unit tests (headless)
 
 ## Next “feel” upgrades worth doing
-- Supercruise + nav assist (“7-second rule”)
+- Supercruise drop/approach tuning (more natural exit + approach corridor guidance)
 - Mission variety (bounty / passenger / multi-hop) + reputation
 - Mission board persistence + better failure/penalty handling
 - NPC traffic that actually moves station inventories/prices

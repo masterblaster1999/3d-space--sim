@@ -10,26 +10,13 @@
 // incomplete (notably Windows' legacy gl.h).
 #include <SDL_opengl_glext.h>
 
-// ---- Compatibility typedefs (OpenGL 1.1 core) ----
+// Some header combinations (notably on Windows) can still miss PFN typedefs for
+// core OpenGL 1.1 functions (e.g. glGenTextures). The missing typedefs cause
+// MSVC to fall back to the old C "default-int" assumption, which then produces
+// a huge cascade of confusing syntax errors.
 //
-// Some OpenGL headers (notably Windows' legacy gl.h and some platform SDKs)
-// do not provide PFNGL*PROC typedefs for *core* OpenGL 1.1 functions like
-// glGenTextures / glBindTexture / glTexImage2D.
-//
-// We intentionally keep a tiny SDL_GL_GetProcAddress-based loader (instead of
-// bundling a full loader like GLAD), so we provide the minimal missing PFN*
-// typedefs here when they're absent.
-//
-// This fixes MSVC errors like:
-//   "missing type specifier - int assumed" / "missing ';' before identifier 'GenTextures'"
-//
-#ifndef APIENTRY
-#  define APIENTRY
-#endif
-
-#ifndef APIENTRYP
-#  define APIENTRYP APIENTRY *
-#endif
+// SDL_opengl_glext.h typically provides these, but we add small, guarded
+// fallbacks so the project builds reliably across toolchains.
 
 #ifndef PFNGLGENTEXTURESPROC
 typedef void (APIENTRYP PFNGLGENTEXTURESPROC)(GLsizei n, GLuint* textures);

@@ -149,6 +149,20 @@ static math::Vec3d stationVelKmS(const sim::Station& st, double timeDays) {
   return (b - a) * (1.0 / dt);
 }
 
+static math::Vec3d planetPosKm(const sim::Planet& p, double timeDays) {
+  const math::Vec3d posAU = sim::orbitPosition3DAU(p.orbit, timeDays);
+  return posAU * kAU_KM;
+}
+
+static math::Vec3d planetVelKmS(const sim::Planet& p, double timeDays) {
+  // Numeric derivative over a short window.
+  const double epsDays = 0.001; // 86.4s
+  const math::Vec3d a = planetPosKm(p, timeDays - epsDays);
+  const math::Vec3d b = planetPosKm(p, timeDays + epsDays);
+  const double dt = epsDays * 2.0 * 86400.0;
+  return (b - a) * (1.0 / dt);
+}
+
 static math::Quatd stationOrient(const sim::Station& st, const math::Vec3d& posKm, double timeDays) {
   // Station local +Z points outward from the slot.
   // We point it away from the star (radial outward) for intuitive docking.
@@ -627,6 +641,10 @@ int main(int argc, char** argv) {
   // Time
   double timeDays = 0.0;
   double timeScale = 60.0; // simulated seconds per real second
+  // Discrete time-acceleration steps (sim seconds / real second).
+  // Kept fairly conservative so ship physics stays stable.
+  const std::array<double, 5> timeScalePresets{1.0, 10.0, 60.0, 600.0, 3600.0};
+  std::size_t timeScalePresetIdx = 2; // 60x
   bool paused = false;
 
   // Economy
@@ -691,6 +709,16 @@ int main(int argc, char** argv) {
 
   // Flight assistance
   bool autopilot = false;
+
+  // Mouse steering (for rotation). Designed so you can still use ImGui/UI.
+  // Default: hold Right Mouse Button to steer.
+  bool mouseSteerEnabled = true;
+  bool mouseSteerHoldRmb = true;
+  bool mouseSteerToggleActive = false; // used when hold-RMB mode is disabled
+  bool mouseSteerInvertX = false;
+  bool mouseSteerInvertY = false;
+  float mouseSteerSensitivity = 0.0045f; // torque per pixel (tuned by feel)
+  bool mouseSteerEngaged = false;        // runtime, for UI/status
 
   // Supercruise-lite
   bool supercruise = false;
@@ -931,6 +959,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   auto last = std::chrono::high_resolution_clock::now();
 
   SDL_SetRelativeMouseMode(SDL_FALSE);
+  SDL_GetRelativeMouseState(nullptr, nullptr); // flush any initial delta
+  bool mouseCaptured = false;
 
   while (running) {
     // Timing
@@ -1083,7 +1113,41 @@ policeAlertUntilDays = 0.0;
 
         if (event.key.keysym.sym == SDLK_SPACE) paused = !paused;
 
+        // Time scale (simulation speed): [ / ]
+        if (!io.WantCaptureKeyboard) {
+          if (event.key.keysym.sym == SDLK_LEFTBRACKET) {
+            if (timeScalePresetIdx > 0) {
+              timeScalePresetIdx--;
+              timeScale = timeScalePresets[timeScalePresetIdx];
+              toast(toasts, "Time scale: " + std::to_string((int)timeScale) + "x", 1.5);
+            }
+          }
+          if (event.key.keysym.sym == SDLK_RIGHTBRACKET) {
+            if (timeScalePresetIdx + 1 < timeScalePresets.size()) {
+              timeScalePresetIdx++;
+              timeScale = timeScalePresets[timeScalePresetIdx];
+              toast(toasts, "Time scale: " + std::to_string((int)timeScale) + "x", 1.5);
+            }
+          }
+        }
+
         if (event.key.keysym.sym == SDLK_p) autopilot = !autopilot;
+
+        // Mouse steering toggle (only meaningful when hold-RMB is disabled).
+        if (!io.WantCaptureKeyboard && event.key.keysym.sym == SDLK_m) {
+          if (mouseSteerHoldRmb) {
+            mouseSteerEnabled = !mouseSteerEnabled;
+            if (!mouseSteerEnabled && mouseCaptured) {
+              SDL_SetRelativeMouseMode(SDL_FALSE);
+              SDL_GetRelativeMouseState(nullptr, nullptr);
+              mouseCaptured = false;
+            }
+            toast(toasts, std::string("Mouse steering: ") + (mouseSteerEnabled ? "enabled" : "disabled"), 1.6);
+          } else {
+            mouseSteerToggleActive = !mouseSteerToggleActive;
+            toast(toasts, std::string("Mouse steering: ") + (mouseSteerToggleActive ? "ON" : "OFF"), 1.6);
+          }
+        }
 
         if (event.key.keysym.sym == SDLK_h) {
           // Supercruise-lite toggle (in-system travel assist).
@@ -1459,6 +1523,45 @@ if (bestIdx >= 0) {
       input.dampers = dampers;
     }
 
+    // Mouse steering (rotation) - uses SDL relative mouse mode while active.
+    // Default: hold RMB to steer.
+    bool wantMouseSteer = false;
+    if (mouseSteerEnabled && !docked && !captureKeys && fsdState == FsdState::Idle && !supercruise && !autopilot) {
+      if (mouseSteerHoldRmb) {
+        const Uint32 m = SDL_GetMouseState(nullptr, nullptr);
+        wantMouseSteer = (m & SDL_BUTTON(SDL_BUTTON_RIGHT)) != 0;
+      } else {
+        wantMouseSteer = mouseSteerToggleActive;
+      }
+      // If ImGui is actively using the mouse, don't steal it.
+      if (io.WantCaptureMouse) wantMouseSteer = false;
+    }
+
+    if (wantMouseSteer && !mouseCaptured) {
+      SDL_SetRelativeMouseMode(SDL_TRUE);
+      SDL_GetRelativeMouseState(nullptr, nullptr); // flush
+      mouseCaptured = true;
+    } else if (!wantMouseSteer && mouseCaptured) {
+      SDL_SetRelativeMouseMode(SDL_FALSE);
+      SDL_GetRelativeMouseState(nullptr, nullptr);
+      mouseCaptured = false;
+    }
+
+    mouseSteerEngaged = mouseCaptured;
+
+    if (mouseCaptured) {
+      int dx = 0, dy = 0;
+      SDL_GetRelativeMouseState(&dx, &dy);
+
+      float yaw = (float)dx * mouseSteerSensitivity;
+      float pitch = (float)(-dy) * mouseSteerSensitivity;
+      if (mouseSteerInvertX) yaw = -yaw;
+      if (mouseSteerInvertY) pitch = -pitch;
+
+      input.torqueLocal.y += (double)yaw;
+      input.torqueLocal.x += (double)pitch;
+    }
+
     // Autopilot: station approach assist (keeps you aligned to slot and under approach speed).
     if (autopilot && !docked && target.kind == TargetKind::Station && target.index < currentSystem->stations.size() && !captureKeys) {
       const auto& st = currentSystem->stations[target.index];
@@ -1566,7 +1669,12 @@ if (bestIdx >= 0) {
             ship.setMaxLinearAccelKmS2(6.0);
             ship.setMaxAngularAccelRadS2(1.0);
 
-            const double desiredSpeed = std::clamp(dist * 0.0008, 40.0, supercruiseMaxSpeedKmS);
+            // Supercruise speed law:
+            // - Assist ON: classic "7-second rule" (keep time-to-arrival ~7s, capped by max)
+            // - Assist OFF: gentler proportional controller (slower, hard to overshoot)
+            const double desiredSpeed = supercruiseAssist
+                ? std::clamp(dist / 7.0, 40.0, supercruiseMaxSpeedKmS)
+                : std::clamp(dist * 0.0008, 40.0, supercruiseMaxSpeedKmS);
             const math::Vec3d desiredVel = destVelKmS + dir * desiredSpeed;
             const math::Vec3d dv = desiredVel - ship.velocityKmS();
             const math::Vec3d accelWorldDir = (dv.lengthSq() > 1e-9) ? dv.normalized() : math::Vec3d{0,0,0};
@@ -2660,6 +2768,8 @@ if (showShip) {
   ImGui::Begin("Ship / Status");
 
   ImGui::Text("System: %s", currentSystem->stub.name.c_str());
+  ImGui::Text("Time scale: %.0fx%s", timeScale, paused ? " (PAUSED)" : "");
+  ImGui::TextDisabled("SPACE pause/resume | [ / ] change time scale");
 
   const core::u32 localFaction = currentSystem ? currentSystem->stub.factionId : 0;
   if (localFaction != 0) {
@@ -2751,25 +2861,71 @@ if (showShip) {
 
   // Target summary
   ImGui::Separator();
+  std::optional<math::Vec3d> tgtPosKm;
+  math::Vec3d tgtVelKmS{0,0,0};
+  std::string tgtLabel;
+
   if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
     const auto& st = currentSystem->stations[target.index];
-    ImGui::Text("Target: %s (%.0f km)", st.name.c_str(), (stationPosKm(st, timeDays) - ship.positionKm()).length());
+    tgtPosKm = stationPosKm(st, timeDays);
+    tgtVelKmS = stationVelKmS(st, timeDays);
+    tgtLabel = st.name;
   } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
     const auto& p = currentSystem->planets[target.index];
-    const math::Vec3d pPos = sim::orbitPosition3DAU(p.orbit, timeDays) * kAU_KM;
-    ImGui::Text("Target: %s (%.0f km)", p.name.c_str(), (pPos - ship.positionKm()).length());
+    tgtPosKm = planetPosKm(p, timeDays);
+    tgtVelKmS = planetVelKmS(p, timeDays);
+    tgtLabel = p.name;
   } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
     const auto& c = contacts[target.index];
-    ImGui::Text("Target: %s [%s] (%.0f km)", c.name.c_str(), contactRoleName(c.role), (c.ship.positionKm() - ship.positionKm()).length());
+    if (c.alive) {
+      tgtPosKm = c.ship.positionKm();
+      tgtVelKmS = c.ship.velocityKmS();
+      tgtLabel = c.name + std::string(" [") + contactRoleName(c.role) + "]";
+    }
   } else if (target.kind == TargetKind::Star) {
-    ImGui::Text("Target: Star (%s)", starClassName(currentSystem->star.cls));
+    tgtPosKm = math::Vec3d{0,0,0};
+    tgtVelKmS = math::Vec3d{0,0,0};
+    tgtLabel = std::string("Star (") + starClassName(currentSystem->star.cls) + ")";
+  }
+
+  if (tgtPosKm) {
+    const math::Vec3d relPos = *tgtPosKm - ship.positionKm();
+    const double distKm = relPos.length();
+
+    ImGui::Text("Target: %s (%.0f km)", tgtLabel.c_str(), distKm);
+
+    const math::Vec3d dir = (distKm > 1e-6) ? (relPos / distKm) : math::Vec3d{0,0,1};
+    const math::Vec3d relVel = ship.velocityKmS() - tgtVelKmS;
+    const double relSpeed = relVel.length();
+    const double rangeRate = math::dot(relVel, dir); // + opening, - closing
+    const double closing = -rangeRate;
+
+    auto fmtEta = [](double sec) -> std::string {
+      if (!std::isfinite(sec) || sec < 0.0) return "n/a";
+      if (sec < 60.0) return std::to_string((int)std::round(sec)) + "s";
+      if (sec < 3600.0) return std::to_string((int)std::round(sec / 60.0)) + "m";
+      const int h = (int)std::floor(sec / 3600.0);
+      const int m = (int)std::floor((sec - h * 3600.0) / 60.0);
+      return std::to_string(h) + "h" + std::to_string(m) + "m";
+    };
+
+    std::string eta = "n/a";
+    if (closing > 1e-6) {
+      eta = fmtEta(distKm / closing);
+    } else if (closing < -1e-6) {
+      eta = "opening";
+    }
+
+    ImGui::TextDisabled("Rel v: %.3f km/s | Closing: %.3f km/s | ETA: %s", relSpeed, closing, eta.c_str());
   } else {
     ImGui::Text("Target: (none)  [T station / B planet / N contact / U star]");
   }
 
   ImGui::Separator();
   ImGui::TextDisabled("Controls:");
-  ImGui::BulletText("WASD / QE translate, Mouse or Arrows rotate");
+  ImGui::BulletText("WASD / RF translate, QE roll");
+  ImGui::BulletText("Arrows rotate | Hold RMB + Mouse to pitch/yaw");
+  ImGui::BulletText("[ / ] change time scale (sim speed)");
   ImGui::BulletText("H toggle supercruise (target station/planet)");
   ImGui::BulletText("J engage FSD jump (uses plotted route if present)");
   ImGui::BulletText("P autopilot to station (needs docking clearance)");
@@ -2778,6 +2934,36 @@ if (showShip) {
   ImGui::BulletText("L request docking clearance");
   ImGui::BulletText("TAB Galaxy map, F1 Ship, F2 Market, F3 Contacts, F4 Missions, F6 Scanner");
   ImGui::BulletText("F5 quicksave, F9 quickload");
+
+  ImGui::Separator();
+  ImGui::TextDisabled("Time / Mouse:");
+
+  // Time scale preset dropdown (matches [ / ] hotkeys)
+  {
+    static const char* kTimeItems[] = {"1x", "10x", "60x", "600x", "3600x"};
+    int idx = (int)timeScalePresetIdx;
+    if (ImGui::Combo("Time scale", &idx, kTimeItems, IM_ARRAYSIZE(kTimeItems))) {
+      idx = std::clamp(idx, 0, (int)timeScalePresets.size() - 1);
+      timeScalePresetIdx = (std::size_t)idx;
+      timeScale = timeScalePresets[timeScalePresetIdx];
+    }
+  }
+
+  // Mouse steering settings
+  ImGui::Checkbox("Enable mouse steering", &mouseSteerEnabled);
+  ImGui::Checkbox("Hold RMB to steer", &mouseSteerHoldRmb);
+  if (!mouseSteerHoldRmb) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(press M to toggle)");
+    if (ImGui::Button(mouseSteerToggleActive ? "Steering: ON" : "Steering: OFF")) {
+      mouseSteerToggleActive = !mouseSteerToggleActive;
+    }
+  }
+
+  ImGui::SliderFloat("Mouse sensitivity", &mouseSteerSensitivity, 0.001f, 0.02f, "%.4f");
+  ImGui::Checkbox("Invert mouse X", &mouseSteerInvertX);
+  ImGui::Checkbox("Invert mouse Y", &mouseSteerInvertY);
+  ImGui::TextDisabled("Mouse steering status: %s", mouseSteerEngaged ? "ENGAGED" : "idle");
 
   ImGui::Separator();
   float scMax = (float)supercruiseMaxSpeedKmS;
