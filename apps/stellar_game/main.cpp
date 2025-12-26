@@ -246,6 +246,45 @@ static bool segmentHitsSphere(const math::Vec3d& aKm,
   return (closest - centerKm).lengthSq() <= radiusKm * radiusKm;
 }
 
+static std::optional<double> solveInterceptTimeSec(const math::Vec3d& relPosKm,
+                                                   const math::Vec3d& relVelKmS,
+                                                   double projSpeedKmS) {
+  // Solve |relPos + relVel * t| = projSpeed * t for t > 0.
+  // Returns the smallest positive time-of-impact, or nullopt if no solution.
+  const double s = std::max(1e-6, projSpeedKmS);
+  const double a = relVelKmS.lengthSq() - s * s;
+  const double b = 2.0 * math::dot(relPosKm, relVelKmS);
+  const double c = relPosKm.lengthSq();
+
+  const double eps = 1e-10;
+
+  if (std::abs(a) < eps) {
+    // Linear case: b*t + c = 0
+    if (std::abs(b) < eps) return std::nullopt;
+    const double t = -c / b;
+    return (t > 0.0) ? std::optional<double>(t) : std::nullopt;
+  }
+
+  const double disc = b * b - 4.0 * a * c;
+  if (disc < 0.0) return std::nullopt;
+
+  const double sqrtDisc = std::sqrt(disc);
+
+  // Numerically stable quadratic solve.
+  const double q = -0.5 * (b + (b >= 0.0 ? sqrtDisc : -sqrtDisc));
+  if (std::abs(q) < eps) return std::nullopt;
+
+  const double t0 = q / a;
+  const double t1 = c / q;
+
+  double t = 1e100;
+  if (t0 > 0.0) t = std::min(t, t0);
+  if (t1 > 0.0) t = std::min(t, t1);
+
+  if (t >= 1e99) return std::nullopt;
+  return t;
+}
+
 static bool beginStationSelectorHUD(const sim::StarSystem& sys, int& stationIndex, bool docked, sim::StationId dockedId) {
   bool changed = false;
 
@@ -757,6 +796,9 @@ int main(int argc, char** argv) {
   WeaponType weaponPrimary = WeaponType::BeamLaser;
   WeaponType weaponSecondary = WeaponType::Cannon;
 
+  // Used for HUD lead indicator (shows lead for the last fired weapon).
+  WeaponType lastFiredWeapon = weaponPrimary;
+
   // Derived stats (recomputed from hull/modules)
   double playerHullMax = 100.0;
   double playerShieldMax = 100.0;
@@ -995,6 +1037,9 @@ int main(int argc, char** argv) {
   Target target{};
 
   std::vector<ToastMsg> toasts;
+
+  // Prevent spamming collision/impact toasts every frame.
+  double collisionToastCooldownSec = 0.0;
 
   auto respawnNearStation = [&](const sim::StarSystem& sys, std::size_t stationIdx) {
     if (sys.stations.empty()) {
@@ -1883,6 +1928,7 @@ if (event.key.keysym.sym == SDLK_y) {
           const bool primary = (event.button.button == SDL_BUTTON_LEFT);
 
           const WeaponType wType = primary ? weaponPrimary : weaponSecondary;
+          lastFiredWeapon = wType;
           const WeaponDef& w = weaponDef(wType);
 
           double& cd = primary ? weaponPrimaryCooldown : weaponSecondaryCooldown;
@@ -3117,7 +3163,68 @@ for (const auto& c : contacts) {
 
             ship.setPositionKm(ship.positionKm() + stQ.rotate(pushLocal));
             ship.setVelocityKmS(stV); // kill relative motion on impact
-            toast(toasts, "Collision!", 1.2);
+            if (collisionToastCooldownSec <= 0.0) {
+              toast(toasts, "Collision!", 1.2);
+              collisionToastCooldownSec = 0.8;
+            }
+            break;
+          }
+        }
+      }
+
+      // Collisions (player with planets / star) + low-altitude heating.
+      // This prevents flying through bodies and adds a bit of "danger close to gravity wells".
+      if (!docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle && currentSystem) {
+        // Star is at origin in system space.
+        {
+          const double rStarKm = std::max(1.0, currentSystem->star.radiusSol * kSOLAR_RADIUS_KM);
+          const double d = ship.positionKm().length();
+          if (d < rStarKm) {
+            const double relSpeed = ship.velocityKmS().length();
+            applyDamage(std::max(300.0, relSpeed * 80.0), playerShield, playerHull);
+
+            const math::Vec3d n = (d > 1e-6) ? (ship.positionKm() / d) : math::Vec3d{0, 1, 0};
+            ship.setPositionKm(n * (rStarKm + 5000.0));
+            ship.setVelocityKmS({0,0,0});
+
+            if (collisionToastCooldownSec <= 0.0) {
+              toast(toasts, "Star exclusion zone!", 1.6);
+              collisionToastCooldownSec = 1.2;
+            }
+          }
+        }
+
+        // Planets
+        for (const auto& p : currentSystem->planets) {
+          const math::Vec3d pPos = planetPosKm(p, timeDays);
+          const math::Vec3d pVel = planetVelKmS(p, timeDays);
+
+          const double rKm = std::max(1.0, p.radiusEarth * kEARTH_RADIUS_KM);
+          const math::Vec3d rel = ship.positionKm() - pPos;
+          const double dist = rel.length();
+          const double alt = dist - rKm;
+
+          // Very simple "atmosphere" heat when skimming very low.
+          // (Not physically accurate, but it gives pilots a reason to respect altitude.)
+          const double atmKm = std::max(120.0, rKm * 0.015);
+          if (alt > 0.0 && alt < atmKm) {
+            const double t = std::clamp(1.0 - alt / atmKm, 0.0, 1.0);
+            heat = std::min(120.0, heat + (8.0 + 28.0 * t) * dtReal);
+          }
+
+          // Impact / crash
+          if (dist < rKm) {
+            const double relSpeed = (ship.velocityKmS() - pVel).length();
+            applyDamage(std::max(120.0, relSpeed * 55.0), playerShield, playerHull);
+
+            const math::Vec3d n = (dist > 1e-6) ? (rel / dist) : math::Vec3d{0, 1, 0};
+            ship.setPositionKm(pPos + n * (rKm + 2000.0));
+            ship.setVelocityKmS(pVel);
+
+            if (collisionToastCooldownSec <= 0.0) {
+              toast(toasts, "IMPACT!", 1.6);
+              collisionToastCooldownSec = 1.2;
+            }
             break;
           }
         }
@@ -3673,6 +3780,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     for (auto& t : toasts) t.ttl -= dtReal;
     toasts.erase(std::remove_if(toasts.begin(), toasts.end(), [](const ToastMsg& t){ return t.ttl <= 0.0; }), toasts.end());
 
+    // Cooldowns
+    collisionToastCooldownSec = std::max(0.0, collisionToastCooldownSec - dtReal);
+
     // ---- Camera follow (third-person) ----
     render::Camera cam;
     int w = 1280, h = 720;
@@ -3958,8 +4068,90 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         }
       }
 
+      // Kinetic lead indicator (projectile weapons): helps make early combat feel fair.
+      if (!docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle &&
+          target.kind == TargetKind::Contact && target.index < contacts.size()) {
+        const auto& c = contacts[target.index];
+        if (c.alive) {
+          const WeaponDef& lw = weaponDef(lastFiredWeapon);
+          if (!lw.beam && lw.projSpeedKmS > 1e-6) {
+            const math::Vec3d relPos = c.ship.positionKm() - ship.positionKm();
+            const math::Vec3d relVel = c.ship.velocityKmS() - ship.velocityKmS();
+            if (auto tHit = solveInterceptTimeSec(relPos, relVel, lw.projSpeedKmS)) {
+              const double t = *tHit;
+              // Ignore absurd solutions (keeps the indicator stable).
+              if (t > 0.0 && t < 180.0) {
+                const math::Vec3d leadKm = c.ship.positionKm() + c.ship.velocityKmS() * t;
+                ImVec2 pxLead{};
+                if (projectToScreen(toRenderU(leadKm), view, proj, w, h, pxLead)) {
+                  const ImU32 col = IM_COL32(120, 255, 220, 200);
+                  draw->AddCircle({pxLead.x, pxLead.y}, 11.0f, col, 1.6f);
+                  draw->AddLine({pxLead.x - 7, pxLead.y}, {pxLead.x + 7, pxLead.y}, col, 1.1f);
+                  draw->AddLine({pxLead.x, pxLead.y - 7}, {pxLead.x, pxLead.y + 7}, col, 1.1f);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Interdiction HUD: escape vector marker + progress bar (supercruise only).
+      if (supercruiseState == SupercruiseState::Active && interdictionState != InterdictionState::None) {
+        const math::Vec3d escDir = interdictionEscapeDir.normalized();
+        const math::Vec3d escPosKm = ship.positionKm() + escDir * 200000.0;
+
+        ImVec2 pxEsc{};
+        if (projectToScreen(toRenderU(escPosKm), view, proj, w, h, pxEsc)) {
+          const ImU32 col = IM_COL32(255, 130, 90, 220);
+          draw->AddCircle({pxEsc.x, pxEsc.y}, 18.0f, col, 2.0f);
+          draw->AddText({pxEsc.x + 20.0f, pxEsc.y - 10.0f}, col, "ESC");
+        }
+
+        const float barW = 220.0f;
+        const float barH = 10.0f;
+        const float frac = (float)std::clamp(interdictionEscapeMeter, 0.0, 1.0);
+
+        const ImVec2 p0(center.x - barW * 0.5f, 18.0f);
+        const ImVec2 p1(center.x + barW * 0.5f, 18.0f + barH);
+
+        draw->AddRectFilled(p0, p1, IM_COL32(20, 20, 20, 160), 3.0f);
+        draw->AddRectFilled(p0, {p0.x + barW * frac, p1.y}, IM_COL32(255, 130, 90, 200), 3.0f);
+        draw->AddRect(p0, p1, IM_COL32(255, 200, 170, 220), 3.0f);
+
+        draw->AddText({p0.x, p1.y + 2.0f}, IM_COL32(255, 200, 170, 220), "INTERDICTION");
+      }
+
+      // Supercruise HUD (distance/ETA + safe-drop indicator).
+      if (supercruiseState != SupercruiseState::Idle) {
+        ImVec2 ds = io.DisplaySize;
+        float y0 = ds.y - 78.0f;
+
+        char buf[256];
+        const ImU32 col = (supercruiseState == SupercruiseState::Active && supercruiseSafeDropReady)
+                            ? IM_COL32(160, 255, 190, 220)
+                            : IM_COL32(200, 210, 240, 210);
+
+        if (supercruiseState == SupercruiseState::Charging) {
+          std::snprintf(buf, sizeof(buf), "Supercruise: CHARGING (%.1fs)", supercruiseChargeRemainingSec);
+        } else if (supercruiseState == SupercruiseState::Cooldown) {
+          std::snprintf(buf, sizeof(buf), "Supercruise: COOLDOWN (%.1fs)", supercruiseCooldownRemainingSec);
+        } else {
+          std::snprintf(buf, sizeof(buf), "Supercruise: %.0f km | ETA %.1fs | closing %.1f km/s | %s",
+                        supercruiseDistKm,
+                        supercruiseTtaSec,
+                        supercruiseClosingKmS,
+                        supercruiseSafeDropReady ? "SAFE DROP" : "DROP UNSAFE");
+        }
+
+        draw->AddText({18.0f, y0}, col, buf);
+        if (supercruiseState == SupercruiseState::Active) {
+          draw->AddText({18.0f, y0 + 18.0f}, col, "Press H to drop (assist auto-drops in SAFE window).");
+        }
+      }
+
       // Docking corridor HUD for targeted station
-      if (currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+      if (supercruiseState == SupercruiseState::Idle && fsdState == FsdState::Idle &&
+          currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
         const auto& st = currentSystem->stations[target.index];
 
         const math::Vec3d stPos = stationPosKm(st, timeDays);
@@ -4194,6 +4386,7 @@ if (showShip) {
   ImGui::BulletText("WASD / Space/Ctrl: translate | Arrows: pitch/yaw | Q/E: roll");
   ImGui::BulletText("Shift: boost | X: brake | LMB: %s | RMB: %s", weaponDef(weaponPrimary).name, weaponDef(weaponSecondary).name);
   ImGui::BulletText("H: supercruise (charge/engage). While active: H drops (~7s safe). During interdiction: H submits");
+  ImGui::BulletText("HUD: kinetic lead marker shows where to aim for moving targets (projectile weapons)");
   ImGui::BulletText("J engage FSD jump (uses plotted route if present)");
   ImGui::BulletText("P: autopilot to station (staging + corridor guidance)");
   ImGui::BulletText("T/B/N/U cycle targets, Y clear target");

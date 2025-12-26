@@ -25,6 +25,8 @@ This repo contains:
 ### In-system flight
 - 6DOF-ish flight with dampers / boost / brake.
 - Autopilot can fly to the current target.
+- Planet/star collision + low-altitude heating (simple danger close to gravity wells).
+- Projectile lead indicator for kinetic weapons (HUD).
 
 ### Galaxy streaming
 - A simple galaxy map that streams nearby systems from a procedural seed.
@@ -49,7 +51,9 @@ This repo contains:
 - Request clearance: **L**
 - Dock/Undock: **G**
 - Autopilot approach: **P**
-- Fire laser: **Left Mouse**
+- Fire primary/secondary: **Left Mouse / Right Mouse**
+- Supercruise: **H** engage/drop (assist auto-drops in SAFE window)
+- Interdiction: align to escape vector (HUD) | **H** submit
 - FSD jump: **J** (to selected system in Galaxy)
 - UI: **TAB** Galaxy, **F1** Flight, **F2** Market, **F3** Contacts, **F4** Missions, **F6** Scanner
 - Save/Load: **F5 / F9**

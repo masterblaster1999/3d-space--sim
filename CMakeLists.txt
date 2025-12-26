@@ -29,7 +29,12 @@ set(STELLAR_SDL_TARGET "")
 set(IMGUI_TARGET "")
 
 if (STELLAR_ENABLE_RENDER)
-  find_package(OpenGL REQUIRED)
+  find_package(OpenGL QUIET)
+  if (NOT OpenGL_FOUND)
+    message(WARNING "OpenGL not found. Disabling STELLAR_ENABLE_RENDER/STELLAR_ENABLE_IMGUI. Configure with -DSTELLAR_ENABLE_RENDER=OFF for headless builds, or install OpenGL development packages.")
+    set(STELLAR_ENABLE_RENDER OFF CACHE BOOL "" FORCE)
+    set(STELLAR_ENABLE_IMGUI OFF CACHE BOOL "" FORCE)
+  else()
 
   # SDL2
   find_package(SDL2 CONFIG QUIET)
@@ -87,6 +92,7 @@ if (STELLAR_ENABLE_RENDER)
     target_compile_definitions(imgui_lib PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
     set(IMGUI_TARGET imgui_lib)
   endif()
+  endif() # OpenGL_FOUND
 endif()
 
 # ---- Library ----
