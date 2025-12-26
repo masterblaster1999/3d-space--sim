@@ -84,7 +84,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{6};
+  int version{7};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -128,6 +128,11 @@ struct SaveGame {
   // Missions
   core::u64 nextMissionId{1};
   std::vector<Mission> missions{};
+
+  // Mission board (cached offers) - persisted so boards don't reroll on UI refresh / reload.
+  StationId missionOffersStationId{0};
+  int missionOffersDayStamp{-1};
+  std::vector<Mission> missionOffers{};
 
   // Reputation
   std::vector<FactionReputation> reputation{};

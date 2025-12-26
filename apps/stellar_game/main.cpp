@@ -347,6 +347,10 @@ struct Contact {
   double tradeCapacityKg{180.0}; // cargo capacity (kg)
   double tradeCooldownUntilDays{0.0};
 
+  // Traders use a crude "supercruise" when far from the player to keep the in-system economy moving.
+  double tradeSupercruiseSpeedKmS{9000.0};
+  double tradeSupercruiseDropDistKm{120000.0};
+
   double fireCooldown{0.0}; // seconds
   bool alive{true};
 };
@@ -825,9 +829,25 @@ int main(int argc, char** argv) {
   std::vector<sim::Mission> missions;
   std::unordered_map<core::u32, double> repByFaction;
 
+  // Smuggling / contraband legality (per faction, deterministic bitmask of illegal commodities)
+  std::unordered_map<core::u32, core::u32> illegalMaskByFaction;
+
   // Law / crime (per-faction bounties)
   std::unordered_map<core::u32, double> bountyByFaction;
   double policeAlertUntilDays = 0.0;
+
+  // Cargo scans (contraband)
+  enum class CargoScanSourceKind { Station, Police };
+  bool cargoScanActive = false;
+  CargoScanSourceKind cargoScanSourceKind = CargoScanSourceKind::Station;
+  sim::StationId cargoScanStationId = 0;
+  core::u64 cargoScanContactId = 0;
+  core::u32 cargoScanFactionId = 0;
+  std::string cargoScanSourceName;
+  double cargoScanProgressSec = 0.0;
+  double cargoScanDurationSec = 0.0;
+  double cargoScanRangeKm = 0.0;
+  double cargoScanCooldownUntilDays = 0.0;
 
   // Exploration / discovery
   std::unordered_set<core::u64> scannedKeys; // scanned bodies/stations in the universe (player-local)
@@ -1041,13 +1061,73 @@ auto clearBounty = [&](core::u32 factionId) {
   bountyByFaction[factionId] = 0.0;
 };
 
-auto commitCrime = [&](core::u32 factionId, double bountyAddCr, double repPenalty, const std::string& reason) {
+auto commitCrime = [&](core::u32 factionId, double bountyAddCr, double repPenalty, const std::string& reason, bool showToast = true) {
   if (factionId == 0) return;
   addBounty(factionId, bountyAddCr);
   addRep(factionId, repPenalty);
   policeAlertUntilDays = std::max(policeAlertUntilDays, timeDays + (120.0 / 86400.0)); // 2 minutes
   nextPoliceSpawnDays = std::min(nextPoliceSpawnDays, timeDays + (6.0 / 86400.0));
-  toast(toasts, "Crime (" + factionName(factionId) + "): " + reason, 3.0);
+  if (showToast) {
+    toast(toasts, "Crime (" + factionName(factionId) + "): " + reason, 3.0);
+  }
+};
+
+
+// --- Smuggling / contraband -------------------------------------------------
+auto commodityBit = [](econ::CommodityId cid) -> core::u32 {
+  return (core::u32)1u << (core::u32)cid;
+};
+
+auto illegalMaskForFaction = [&](core::u32 factionId) -> core::u32 {
+  if (factionId == 0) return 0u;
+
+  auto it = illegalMaskByFaction.find(factionId);
+  if (it != illegalMaskByFaction.end()) return it->second;
+
+  // Deterministic per-faction rules (seeded so it stays stable across reloads).
+  core::SplitMix64 r(universe.seed() ^ (core::u64)factionId * 0x9E3779B97F4A7C15ull);
+
+  core::u32 mask = 0u;
+
+  // Pick 1 vice good (luxury or medicine) and often 1 controlled-tech good.
+  const std::array<econ::CommodityId, 2> vice{econ::CommodityId::Luxury, econ::CommodityId::Medicine};
+  const std::array<econ::CommodityId, 2> tech{econ::CommodityId::Electronics, econ::CommodityId::Machinery};
+
+  mask |= commodityBit(vice[(std::size_t)(r.nextU32() % vice.size())]);
+  if (r.nextUnit() < 0.65) {
+    mask |= commodityBit(tech[(std::size_t)(r.nextU32() % tech.size())]);
+  }
+
+  illegalMaskByFaction[factionId] = mask;
+  return mask;
+};
+
+auto isIllegalCommodity = [&](core::u32 factionId, econ::CommodityId cid) -> bool {
+  if (factionId == 0) return false;
+  return (illegalMaskForFaction(factionId) & commodityBit(cid)) != 0u;
+};
+
+auto illegalListString = [&](core::u32 factionId) -> std::string {
+  const core::u32 mask = illegalMaskForFaction(factionId);
+  if (mask == 0u) return "None";
+  std::string out;
+  for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+    if ((mask & ((core::u32)1u << (core::u32)i)) == 0u) continue;
+    if (!out.empty()) out += ", ";
+    out += std::string(econ::commodityName((econ::CommodityId)i));
+  }
+  return out.empty() ? "None" : out;
+};
+
+auto hasIllegalCargo = [&](core::u32 factionId) -> bool {
+  const core::u32 mask = illegalMaskForFaction(factionId);
+  if (mask == 0u) return false;
+  for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+    if ((mask & ((core::u32)1u << (core::u32)i)) != 0u) {
+      if (cargo[i] > 1e-6) return true;
+    }
+  }
+  return false;
 };
 
 // Scan/discovery keys (player-local)
@@ -1363,6 +1443,11 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           s.nextMissionId = nextMissionId;
           s.missions = missions;
 
+          // Mission board cache
+          s.missionOffersStationId = missionOffersStationId;
+          s.missionOffersDayStamp = missionOffersDayStamp;
+          s.missionOffers = missionOffers;
+
           s.reputation.clear();
           s.reputation.reserve(repByFaction.size());
           for (const auto& kv : repByFaction) {
@@ -1427,6 +1512,11 @@ for (const auto& [fid, b] : bountyByFaction) {
 
             nextMissionId = s.nextMissionId;
             missions = s.missions;
+
+            // Mission board cache
+            missionOffersStationId = s.missionOffersStationId;
+            missionOffersDayStamp = s.missionOffersDayStamp;
+            missionOffers = s.missionOffers;
 
             repByFaction.clear();
             for (const auto& r : s.reputation) repByFaction[r.factionId] = r.rep;
@@ -2609,6 +2699,10 @@ for (const auto& c : contacts) {
     // Cargo capacity (kg) varies per trader.
     t.tradeCapacityKg = rng.range(120.0, 420.0);
 
+    // Traders have a high-speed shortcut when far from the player (keeps economy moving).
+    t.tradeSupercruiseSpeedKmS = rng.range(7000.0, 14000.0);
+    t.tradeSupercruiseDropDistKm = rng.range(70000.0, 140000.0);
+
     // Assign an initial hauling job (if possible) and load from source inventory.
     planTraderHaul(t, t.homeStationIndex);
 
@@ -2799,6 +2893,8 @@ for (const auto& c : contacts) {
       sim::ShipInput ai{};
       ai.dampers = true;
 
+      double dtStep = dtSim;
+
       const bool fleeing = (timeDays < c.fleeUntilDays);
       if (fleeing) {
         // Run away from player.
@@ -2812,11 +2908,38 @@ for (const auto& c : contacts) {
           const auto& st = currentSystem->stations[destIdx];
           const math::Vec3d stPos = stationPosKm(st, timeDays);
 
+          const math::Vec3d stVel = stationVelKmS(st, timeDays);
+
           // Approach to comms-range and "trade" (we simulate docking by adjusting inventories).
           const double desiredDist = std::clamp(st.commsRangeKm * 0.55, st.radiusKm * 6.0, st.radiusKm * 14.0);
-          chaseTarget(c.ship, ai, stPos, stationVelKmS(st, timeDays), desiredDist, 1.20, 1.0);
 
-          const double distKm = (c.ship.positionKm() - stPos).length();
+          double distKm = (c.ship.positionKm() - stPos).length();
+          const double playerDistKm = (c.ship.positionKm() - ship.positionKm()).length();
+
+          // Trader "supercruise": when far away (and not in the player's immediate vicinity),
+          // move quickly along the route so in-system economy actually changes during play.
+          const bool allowSuper = docked || (playerDistKm > 160000.0);
+          if (allowSuper && distKm > desiredDist + 60000.0) {
+            const math::Vec3d to = (stPos - c.ship.positionKm());
+            if (to.lengthSq() > 1e-6) {
+              const math::Vec3d n = to.normalized();
+              const double speed = std::max(1500.0, c.tradeSupercruiseSpeedKmS);
+              const double stepKm = std::min(distKm - desiredDist, speed * dtSim);
+
+              c.ship.setPositionKm(c.ship.positionKm() + n * stepKm);
+              c.ship.setVelocityKmS(stVel);
+              c.ship.setAngularVelocityRadS({0,0,0});
+              c.ship.setOrientation(quatFromTo({0,0,1}, n));
+
+              // We already moved this frame.
+              dtStep = 0.0;
+              distKm = (c.ship.positionKm() - stPos).length();
+            }
+          } else {
+            // Normal flight when the player is near (keeps things readable/physical).
+            chaseTarget(c.ship, ai, stPos, stVel, desiredDist, 6.0, 1.0);
+          }
+
           const bool arrived = distKm < st.commsRangeKm * 0.65;
 
           if (arrived && timeDays >= c.tradeCooldownUntilDays) {
@@ -2861,7 +2984,7 @@ for (const auto& c : contacts) {
         }
       }
 
-      c.ship.step(dtSim, ai);
+      c.ship.step(dtStep, ai);
       continue;
     }
 
@@ -2999,6 +3122,196 @@ for (const auto& c : contacts) {
           }
         }
       }
+
+    // --- Cargo scans / contraband ---
+    {
+      const core::u32 jurisdiction = currentSystem ? currentSystem->stub.factionId : 0;
+      const bool canScan = (!docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle && jurisdiction != 0);
+
+      auto cancelCargoScan = [&]() {
+        cargoScanActive = false;
+        cargoScanProgressSec = 0.0;
+        cargoScanDurationSec = 0.0;
+        cargoScanRangeKm = 0.0;
+        cargoScanStationId = 0;
+        cargoScanContactId = 0;
+        cargoScanFactionId = 0;
+        cargoScanSourceName.clear();
+      };
+
+      if (!canScan) {
+        if (cargoScanActive) cancelCargoScan();
+      } else {
+        const bool contraband = hasIllegalCargo(jurisdiction);
+
+        // Update active scan
+        if (cargoScanActive) {
+          bool inRange = false;
+          const sim::Station* scanStation = nullptr;
+
+          if (cargoScanSourceKind == CargoScanSourceKind::Station) {
+            for (const auto& st : currentSystem->stations) {
+              if (st.id == cargoScanStationId) {
+                scanStation = &st;
+                break;
+              }
+            }
+            if (scanStation) {
+              const double dist = (ship.positionKm() - stationPosKm(*scanStation, timeDays)).length();
+              inRange = dist < cargoScanRangeKm;
+            }
+          } else {
+            for (const auto& c : contacts) {
+              if (c.id == cargoScanContactId && c.role == ContactRole::Police && c.alive) {
+                const double dist = (ship.positionKm() - c.ship.positionKm()).length();
+                inRange = dist < cargoScanRangeKm;
+                break;
+              }
+            }
+          }
+
+          if (!inRange) {
+            cancelCargoScan();
+            cargoScanCooldownUntilDays = std::max(cargoScanCooldownUntilDays, timeDays + (20.0 / 86400.0));
+          } else {
+            cargoScanProgressSec += dtReal;
+            if (cargoScanProgressSec >= cargoScanDurationSec) {
+              // Choose a station to reference prices (if we have one).
+              const sim::Station* priceRef = scanStation;
+              if (!priceRef && currentSystem && !currentSystem->stations.empty()) {
+                double best = 1e100;
+                for (const auto& st : currentSystem->stations) {
+                  const double d = (ship.positionKm() - stationPosKm(st, timeDays)).length();
+                  if (d < best) {
+                    best = d;
+                    priceRef = &st;
+                  }
+                }
+              }
+
+              double illegalValueCr = 0.0;
+              std::string detail;
+              int shown = 0;
+
+              for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+                const auto cid = (econ::CommodityId)i;
+                if (!isIllegalCommodity(jurisdiction, cid)) continue;
+                const double units = cargo[i];
+                if (units <= 1e-6) continue;
+
+                double mid = econ::commodityDef(cid).basePrice;
+                if (priceRef) {
+                  auto& stEco = universe.stationEconomy(*priceRef, timeDays);
+                  const auto q = econ::quote(stEco, priceRef->economyModel, cid, 0.10);
+                  mid = q.mid;
+                }
+
+                illegalValueCr += units * mid;
+
+                if (shown < 2) {
+                  if (!detail.empty()) detail += ", ";
+                  detail += std::string(econ::commodityName(cid)) + " x" + std::to_string((int)std::round(units));
+                } else if (shown == 2) {
+                  detail += ", ...";
+                }
+                ++shown;
+
+                cargo[i] = 0.0; // confiscated
+              }
+
+              if (illegalValueCr <= 0.0) {
+                toast(toasts, "Cargo scan complete: clean.", 2.0);
+              } else {
+                const double fineCr = 200.0 + illegalValueCr * 0.65;
+                const double paidCr = std::min(credits, fineCr);
+                credits -= paidCr;
+                const double unpaidCr = fineCr - paidCr;
+
+                const double repPenalty = -std::clamp(2.0 + illegalValueCr / 3000.0, 2.0, 10.0);
+                addRep(jurisdiction, repPenalty);
+
+                double bountyAddCr = 0.0;
+                if (unpaidCr > 1e-6) {
+                  bountyAddCr = unpaidCr;
+                  addBounty(jurisdiction, bountyAddCr);
+                }
+
+                // Heightened police attention for a short window.
+                policeAlertUntilDays = std::max(policeAlertUntilDays, timeDays + (90.0 / 86400.0));
+                nextPoliceSpawnDays = std::min(nextPoliceSpawnDays, timeDays + (6.0 / 86400.0));
+
+                // A bit of "heat" (affects encounter rates).
+                heat = std::min(100.0, heat + std::min(20.0, illegalValueCr / 2000.0));
+
+                std::string msg = "Contraband detected! Confiscated: "
+                                  + (detail.empty() ? std::string("illegal cargo") : detail)
+                                  + ". Fine: " + std::to_string((int)std::round(fineCr)) + " cr"
+                                  + (unpaidCr > 1e-6 ? " (unpaid -> bounty)" : "")
+                                  + ". Rep " + std::to_string((int)std::round(repPenalty));
+                toast(toasts, msg, 4.0);
+              }
+
+              cancelCargoScan();
+              cargoScanCooldownUntilDays = std::max(cargoScanCooldownUntilDays, timeDays + (90.0 / 86400.0));
+            }
+          }
+        } else if (timeDays >= cargoScanCooldownUntilDays) {
+          // Determine potential scanner source: nearest police / station in-range.
+          const sim::Station* bestStation = nullptr;
+          double bestStationDist = 1e100;
+          for (const auto& st : currentSystem->stations) {
+            if (st.factionId != jurisdiction) continue;
+            const double d = (ship.positionKm() - stationPosKm(st, timeDays)).length();
+            if (d < bestStationDist) {
+              bestStationDist = d;
+              bestStation = &st;
+            }
+          }
+
+          const Contact* bestPolice = nullptr;
+          double bestPoliceDist = 1e100;
+          for (const auto& c : contacts) {
+            if (!c.alive || c.role != ContactRole::Police) continue;
+            const double d = (ship.positionKm() - c.ship.positionKm()).length();
+            if (d < bestPoliceDist) {
+              bestPoliceDist = d;
+              bestPolice = &c;
+            }
+          }
+
+          const bool policeInRange = bestPolice && bestPoliceDist < 35000.0;
+          const bool stationInRange = bestStation && bestStationDist < bestStation->commsRangeKm * 0.90;
+
+          if (policeInRange || stationInRange) {
+            double ratePerSec = contraband ? 0.06 : 0.012;
+            if (getRep(jurisdiction) < -20.0) ratePerSec *= 1.25;
+            if (getBounty(jurisdiction) > 1e-6) ratePerSec *= 1.6;
+            ratePerSec *= (1.0 + heat / 140.0);
+
+            if (rng.nextUnit() < ratePerSec * dtReal) {
+              cargoScanActive = true;
+              cargoScanProgressSec = 0.0;
+              cargoScanDurationSec = contraband ? rng.range(5.0, 8.0) : rng.range(3.0, 5.0);
+              cargoScanFactionId = jurisdiction;
+
+              if (policeInRange) {
+                cargoScanSourceKind = CargoScanSourceKind::Police;
+                cargoScanContactId = bestPolice->id;
+                cargoScanRangeKm = 35000.0;
+                cargoScanSourceName = bestPolice->name.empty() ? std::string("Police") : bestPolice->name;
+              } else {
+                cargoScanSourceKind = CargoScanSourceKind::Station;
+                cargoScanStationId = bestStation->id;
+                cargoScanRangeKm = bestStation->commsRangeKm * 0.90;
+                cargoScanSourceName = bestStation->name;
+              }
+
+              toast(toasts, "Incoming cargo scan: " + cargoScanSourceName, 2.5);
+            }
+          }
+        }
+      }
+    }
 
 // --- Scanner progress (missions + exploration) ---
 if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
@@ -3754,6 +4067,25 @@ if (showShip) {
     ImGui::TextDisabled("K cancels scan.");
   }
 
+  if (cargoScanActive) {
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Cargo scan: %s",
+                       cargoScanSourceName.empty() ? "Security" : cargoScanSourceName.c_str());
+    const float frac = (float)std::clamp(cargoScanProgressSec / std::max(0.01, cargoScanDurationSec), 0.0, 1.0);
+    ImGui::ProgressBar(frac, ImVec2(-1, 0));
+    ImGui::TextDisabled("Leave scan range / dock to break scan.");
+  }
+
+  if (currentSystem && currentSystem->stub.factionId != 0) {
+    const core::u32 j = currentSystem->stub.factionId;
+    ImGui::Separator();
+    ImGui::Text("Jurisdiction: %s", factionName(j).c_str());
+    ImGui::Text("Illegal goods: %s", illegalListString(j).c_str());
+    if (hasIllegalCargo(j)) {
+      ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f), "Warning: CONTRABAND on board");
+    }
+  }
+
   // FSD status (Charging / Jumping / Cooling)
   {
     const bool cooling = (fsdState == FsdState::Idle && timeDays < fsdReadyDay);
@@ -4472,12 +4804,13 @@ if (canTrade) {
 
           for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
             const auto cid = (econ::CommodityId)i;
+            const bool illegalHere = isIllegalCommodity(station.factionId, cid);
             const auto q = econ::quote(stEcon, station.economyModel, cid, 0.10);
 
             ImGui::TableNextRow();
 
             ImGui::TableSetColumnIndex(0);
-            ImGui::Text("%s", std::string(econ::commodityName(cid)).c_str());
+            ImGui::Text("%s%s", std::string(econ::commodityName(cid)).c_str(), illegalHere ? " (ILLEGAL)" : "");
 
             ImGui::TableSetColumnIndex(1);
             ImGui::Text("%.0f", q.inventory);
@@ -4500,7 +4833,9 @@ if (canTrade) {
             ImGui::InputFloat("##qty", &qty[i], 1.0f, 10.0f, "%.0f");
 
             ImGui::SameLine();
-            ImGui::BeginDisabled(!canTrade);
+
+            // Buying illegal goods isn't available on the open market; you can still *sell* them (black market).
+            ImGui::BeginDisabled(!canTrade || illegalHere);
             if (ImGui::SmallButton("Buy")) {
               const double buyUnits = std::max(0.0, (double)qty[i]);
               const double addKg = buyUnits * econ::commodityDef(cid).massKg;
@@ -4514,15 +4849,34 @@ if (canTrade) {
                 }
               }
             }
+            ImGui::EndDisabled();
 
             ImGui::SameLine();
-            if (ImGui::SmallButton("Sell")) {
-              const double sellUnits = std::min<double>(qty[i], cargo[i]);
-              if (sellUnits > 0.0) {
-                auto tr = econ::sell(stEcon, station.economyModel, cid, sellUnits, credits, 0.10, feeEff);
-                if (tr.ok) {
-                  cargo[i] -= sellUnits;
-                  cargoKgNow = std::max(0.0, cargoKgNow - sellUnits * econ::commodityDef(cid).massKg);
+            ImGui::BeginDisabled(!canTrade);
+            const char* sellLabel = illegalHere ? "Sell (BM)" : "Sell";
+            if (ImGui::SmallButton(sellLabel)) {
+              const double sellUnitsReq = std::min<double>(qty[i], cargo[i]);
+              if (sellUnitsReq > 0.0) {
+                if (illegalHere) {
+                  // Black market: pay a premium, but storage capacity still applies.
+                  constexpr double kBlackMarketMult = 1.35;
+                  const double moved = econ::addInventory(stEcon, station.economyModel, cid, sellUnitsReq);
+                  if (moved > 0.0) {
+                    credits += q.bid * moved * kBlackMarketMult;
+                    cargo[i] -= moved;
+                    cargoKgNow = std::max(0.0, cargoKgNow - moved * econ::commodityDef(cid).massKg);
+
+                    // A little extra "heat" for dealing in contraband.
+                    heat = std::min(100.0, heat + moved * 0.02);
+                  } else {
+                    toast(toasts, "No space to sell (storage full).", 2.0);
+                  }
+                } else {
+                  auto tr = econ::sell(stEcon, station.economyModel, cid, sellUnitsReq, credits, 0.10, feeEff);
+                  if (tr.ok) {
+                    cargo[i] -= sellUnitsReq;
+                    cargoKgNow = std::max(0.0, cargoKgNow - sellUnitsReq * econ::commodityDef(cid).massKg);
+                  }
                 }
               }
             }
@@ -5006,6 +5360,7 @@ if (canTrade) {
                   }
                 }
 
+                m.id = nextMissionId++;
                 missions.push_back(m);
                 missionOffers.erase(missionOffers.begin() + (std::ptrdiff_t)offerIdx);
                 toast(toasts, "Mission accepted.", 2.0);

@@ -85,6 +85,32 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << "\n";
   }
 
+  // Mission board (cached offers)
+  f << "mission_offers_station " << s.missionOffersStationId << "\n";
+  f << "mission_offers_day " << s.missionOffersDayStamp << "\n";
+  f << "mission_offers " << s.missionOffers.size() << "\n";
+  for (const auto& m : s.missionOffers) {
+    f << "offer "
+      << m.id << " "
+      << static_cast<int>(m.type) << " "
+      << m.fromSystem << " " << m.fromStation << " "
+      << m.toSystem << " " << m.toStation << " "
+      << static_cast<int>(m.commodity) << " "
+      << m.units << " "
+      << m.targetNpcId << " "
+      << m.reward << " "
+      << m.deadlineDay << " "
+      << (m.completed ? 1 : 0) << " "
+      << (m.failed ? 1 : 0) << " "
+      << (m.cargoProvided ? 1 : 0) << " "
+      // Optional / newer fields (kept at end for backward compatibility)
+      << m.factionId << " "
+      << m.viaSystem << " " << m.viaStation << " "
+      << static_cast<int>(m.leg) << " "
+      << (m.scanned ? 1 : 0)
+      << "\n";
+  }
+
   // Reputation
   f << "reputation " << s.reputation.size() << "\n";
   for (const auto& r : s.reputation) {
@@ -285,7 +311,59 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
 
         out.missions.push_back(std::move(m));
       }
-    } else if (key == "reputation") {
+    } else if (key == "mission_offers_station") {
+      f >> out.missionOffersStationId;
+    } else if (key == "mission_offers_day") {
+      f >> out.missionOffersDayStamp;
+    } else if (key == "mission_offers") {
+      std::size_t n = 0;
+      f >> n;
+      out.missionOffers.clear();
+      out.missionOffers.reserve(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        std::string tok;
+        if (!(f >> tok) || tok != "offer") return false;
+
+        std::string line;
+        std::getline(f, line);
+        std::istringstream iss(line);
+
+        Mission m{};
+        int type = 0;
+        int commodity = 0;
+        int completed = 0;
+        int failed = 0;
+        int cargoProvided = 0;
+
+        iss >> m.id
+            >> type
+            >> m.fromSystem >> m.fromStation
+            >> m.toSystem >> m.toStation
+            >> commodity
+            >> m.units
+            >> m.targetNpcId
+            >> m.reward
+            >> m.deadlineDay
+            >> completed
+            >> failed
+            >> cargoProvided;
+
+        m.type = static_cast<MissionType>(type);
+        m.commodity = static_cast<econ::CommodityId>(commodity);
+        m.completed = (completed != 0);
+        m.failed = (failed != 0);
+        m.cargoProvided = (cargoProvided != 0);
+
+        int leg = 0;
+        int scanned = 0;
+        if (iss >> m.factionId >> m.viaSystem >> m.viaStation >> leg >> scanned) {
+          m.leg = static_cast<core::u8>(std::clamp(leg, 0, 255));
+          m.scanned = (scanned != 0);
+        }
+
+        out.missionOffers.push_back(std::move(m));
+      }
+} else if (key == "reputation") {
       std::size_t n = 0;
       f >> n;
       out.reputation.clear();
