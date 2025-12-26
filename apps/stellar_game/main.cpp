@@ -246,45 +246,6 @@ static bool segmentHitsSphere(const math::Vec3d& aKm,
   return (closest - centerKm).lengthSq() <= radiusKm * radiusKm;
 }
 
-static std::optional<double> solveInterceptTimeSec(const math::Vec3d& relPosKm,
-                                                   const math::Vec3d& relVelKmS,
-                                                   double projSpeedKmS) {
-  // Solve |relPos + relVel * t| = projSpeed * t for t > 0.
-  // Returns the smallest positive time-of-impact, or nullopt if no solution.
-  const double s = std::max(1e-6, projSpeedKmS);
-  const double a = relVelKmS.lengthSq() - s * s;
-  const double b = 2.0 * math::dot(relPosKm, relVelKmS);
-  const double c = relPosKm.lengthSq();
-
-  const double eps = 1e-10;
-
-  if (std::abs(a) < eps) {
-    // Linear case: b*t + c = 0
-    if (std::abs(b) < eps) return std::nullopt;
-    const double t = -c / b;
-    return (t > 0.0) ? std::optional<double>(t) : std::nullopt;
-  }
-
-  const double disc = b * b - 4.0 * a * c;
-  if (disc < 0.0) return std::nullopt;
-
-  const double sqrtDisc = std::sqrt(disc);
-
-  // Numerically stable quadratic solve.
-  const double q = -0.5 * (b + (b >= 0.0 ? sqrtDisc : -sqrtDisc));
-  if (std::abs(q) < eps) return std::nullopt;
-
-  const double t0 = q / a;
-  const double t1 = c / q;
-
-  double t = 1e100;
-  if (t0 > 0.0) t = std::min(t, t0);
-  if (t1 > 0.0) t = std::min(t, t1);
-
-  if (t >= 1e99) return std::nullopt;
-  return t;
-}
-
 static bool beginStationSelectorHUD(const sim::StarSystem& sys, int& stationIndex, bool docked, sim::StationId dockedId) {
   bool changed = false;
 
@@ -337,11 +298,20 @@ struct ClearanceState {
   double cooldownUntilDays{0.0};
 };
 
-enum class TargetKind : int { None=0, Station=1, Planet=2, Contact=3, Star=4 };
+enum class TargetKind : int {
+  None = 0,
+  Station = 1,
+  Planet = 2,
+  Contact = 3,
+  Star = 4,
+  Cargo = 5,
+  Asteroid = 6,
+  Signal = 7,
+};
 
 struct Target {
   TargetKind kind{TargetKind::None};
-  std::size_t index{0}; // station/planet/contact index
+  std::size_t index{0}; // index into the relevant list for kind (stations/planets/contacts/...) 
 };
 
 enum class ContactRole : int { Pirate=0, Trader=1, Police=2 };
@@ -390,8 +360,54 @@ struct Contact {
   double tradeSupercruiseSpeedKmS{9000.0};
   double tradeSupercruiseDropDistKm{120000.0};
 
+  // Supercruise "shadows": contacts that are kept near the player during supercruise
+  // so interdictions can happen even though the full combat sim is paused.
+  bool supercruiseShadow{false};
+  math::Vec3d shadowOffsetLocalKm{0,0,0};
+
   double fireCooldown{0.0}; // seconds
   bool alive{true};
+};
+
+// --- Space objects (salvage / mining / encounters) ---
+struct FloatingCargo {
+  core::u64 id{0};
+  econ::CommodityId commodity{econ::CommodityId::Food};
+  double units{0.0};
+  math::Vec3d posKm{0,0,0};
+  math::Vec3d velKmS{0,0,0};
+  double expireDay{0.0};
+};
+
+struct AsteroidNode {
+  core::u64 id{0};
+  math::Vec3d posKm{0,0,0};
+  double radiusKm{2500.0};
+  econ::CommodityId yieldCommodity{econ::CommodityId::Ore};
+  double remainingUnits{120.0}; // units of yieldCommodity remaining
+};
+
+enum class SignalType : int {
+  Distress = 0,
+  Derelict,
+  Resource,
+};
+
+static const char* signalTypeName(SignalType t) {
+  switch (t) {
+    case SignalType::Distress: return "Distress Call";
+    case SignalType::Derelict: return "Derelict";
+    case SignalType::Resource: return "Resource Field";
+    default: return "Signal";
+  }
+}
+
+struct SignalSource {
+  core::u64 id{0};
+  SignalType type{SignalType::Distress};
+  math::Vec3d posKm{0,0,0};
+  double expireDay{0.0};
+  bool resolved{false}; // whether it has "spawned" its content
 };
 
 static void applyDamage(double dmg, double& shield, double& hull) {
@@ -718,6 +734,7 @@ int main(int argc, char** argv) {
     PulseLaser,
     Cannon,
     Railgun,
+    MiningLaser,
   };
 
   struct HullDef {
@@ -783,6 +800,7 @@ int main(int argc, char** argv) {
     {WeaponType::PulseLaser, "Pulse Laser", 5200.0, 0.28, 1.9, 6.0, 230000.0, 0.0, true, 1.00f, 0.80f, 0.20f},
     {WeaponType::Cannon, "Cannon", 0.0, 0.90, 4.5, 22.0, 260000.0, 120.0, false, 1.00f, 1.00f, 0.90f},
     {WeaponType::Railgun, "Railgun", 9800.0, 1.65, 7.5, 45.0, 320000.0, 240.0, false, 0.60f, 0.90f, 1.00f},
+    {WeaponType::MiningLaser, "Mining Laser", 6500.0, 0.22, 1.6, 3.0, 180000.0, 0.0, true, 0.30f, 1.00f, 0.35f},
   };
 
   auto weaponDef = [&](WeaponType t) -> const WeaponDef& {
@@ -795,9 +813,6 @@ int main(int argc, char** argv) {
   int distributorMk = 1;
   WeaponType weaponPrimary = WeaponType::BeamLaser;
   WeaponType weaponSecondary = WeaponType::Cannon;
-
-  // Used for HUD lead indicator (shows lead for the last fired weapon).
-  WeaponType lastFiredWeapon = weaponPrimary;
 
   // Derived stats (recomputed from hull/modules)
   double playerHullMax = 100.0;
@@ -876,7 +891,19 @@ int main(int argc, char** argv) {
 
   // Law / crime (per-faction bounties)
   std::unordered_map<core::u32, double> bountyByFaction;
+  // Bounty vouchers (earned by destroying criminals; redeem later at stations).
+  std::unordered_map<core::u32, double> bountyVoucherByFaction;
   double policeAlertUntilDays = 0.0;
+
+  // When police/stations scan you while wanted, you get a short "submit or fight" window.
+  struct PoliceDemand {
+    bool active{false};
+    core::u32 factionId{0};
+    double amountCr{0.0};
+    double untilDays{0.0};
+    std::string sourceName;
+  };
+  PoliceDemand policeDemand;
 
   // Cargo scans (contraband)
   enum class CargoScanSourceKind { Station, Police };
@@ -928,6 +955,16 @@ int main(int argc, char** argv) {
   double nextPirateSpawnDays = 0.01; // soon after start
   double nextTraderSpawnDays = 0.008;
   double nextPoliceSpawnDays = 0.006;
+
+  // Salvage / mining / signal sources
+  bool cargoScoopDeployed = true;
+  double cargoFullToastCooldownUntilDays = 0.0;
+  std::vector<FloatingCargo> floatingCargo;
+  std::vector<AsteroidNode> asteroids;
+  std::vector<SignalSource> signals;
+  core::u64 nextWorldObjectId = 1;
+  double nextSignalSpawnDays = 0.01;
+  double nextSupercruiseShadowSpawnDays = 0.01;
 
   // Beams (for laser visuals)
   struct Beam { math::Vec3d aU, bU; float r,g,b; double ttl; };
@@ -1038,9 +1075,6 @@ int main(int argc, char** argv) {
 
   std::vector<ToastMsg> toasts;
 
-  // Prevent spamming collision/impact toasts every frame.
-  double collisionToastCooldownSec = 0.0;
-
   auto respawnNearStation = [&](const sim::StarSystem& sys, std::size_t stationIdx) {
     if (sys.stations.empty()) {
       ship.setPositionKm({0,0,-8000.0});
@@ -1063,8 +1097,72 @@ int main(int argc, char** argv) {
     ship.setOrientation(quatFromTo({0,0,1}, -axis));
   };
 
+  auto allocWorldId = [&]() -> core::u64 {
+    // Keep IDs stable within a session; collisions with old IDs don't matter since these are transient.
+    return nextWorldObjectId++;
+  };
+
+  auto randUnit = [&](double maxAbs = 1.0) -> math::Vec3d {
+    math::Vec3d v{rng.range(-maxAbs, maxAbs), rng.range(-maxAbs, maxAbs), rng.range(-maxAbs, maxAbs)};
+    const double lsq = v.lengthSq();
+    if (lsq < 1e-9) return {1, 0, 0};
+    return v / std::sqrt(lsq);
+  };
+
+  auto seedSystemSpaceObjects = [&](const sim::StarSystem& sys) {
+    // Reset transient objects on system entry.
+    floatingCargo.clear();
+    asteroids.clear();
+    signals.clear();
+    cargoFullToastCooldownUntilDays = 0.0;
+
+    // Always seed at least one resource field near a "useful" station so mining is easy to find.
+    if (sys.stations.empty()) return;
+    std::size_t anchorIdx = 0;
+    for (std::size_t i = 0; i < sys.stations.size(); ++i) {
+      const auto t = sys.stations[i].type;
+      if (t == econ::StationType::Mining || t == econ::StationType::Refinery) { anchorIdx = i; break; }
+    }
+
+    const auto& anchor = sys.stations[anchorIdx];
+    const math::Vec3d anchorPos = stationPosKm(anchor, timeDays);
+
+    auto spawnSignal = [&](SignalType type, const math::Vec3d& posKm, double ttlDays) {
+      SignalSource s{};
+      s.id = allocWorldId();
+      s.type = type;
+      s.posKm = posKm;
+      s.expireDay = timeDays + ttlDays;
+      s.resolved = false;
+      signals.push_back(s);
+    };
+
+    auto spawnField = [&](const math::Vec3d& centerKm, int count, econ::CommodityId yield) {
+      for (int i = 0; i < count; ++i) {
+        AsteroidNode a{};
+        a.id = allocWorldId();
+        a.posKm = centerKm + randUnit() * rng.range(15000.0, 75000.0);
+        a.radiusKm = rng.range(2500.0, 7500.0);
+        a.yield = yield;
+        a.remainingUnits = rng.range(90.0, 260.0) * (a.radiusKm / 5000.0);
+        a.chunkAccumulator = 0.0;
+        asteroids.push_back(a);
+      }
+    };
+
+    // A permanent-ish resource field.
+    const math::Vec3d resourcePos = anchorPos + randUnit() * (anchor.commsRangeKm * 1.3 + 120000.0);
+    spawnSignal(SignalType::Resource, resourcePos, 5.0); // lasts several days
+    spawnField(resourcePos, 28, econ::CommodityId::Ore);
+
+    // A derelict somewhere nearby for early salvage.
+    const math::Vec3d derelictPos = anchorPos + randUnit() * (anchor.commsRangeKm * 1.6 + 190000.0);
+    spawnSignal(SignalType::Derelict, derelictPos, 1.0);
+  };
+
   // Spawn near first station for immediate gameplay.
   respawnNearStation(*currentSystem, 0);
+  seedSystemSpaceObjects(*currentSystem);
 
   galaxySelectedSystemId = currentSystem->stub.id;
 
@@ -1105,6 +1203,21 @@ auto clearBounty = [&](core::u32 factionId) {
   if (factionId == 0) return;
   bountyByFaction[factionId] = 0.0;
 };
+
+  auto getVoucher = [&](core::u32 factionId) -> double {
+    auto it = bountyVoucherByFaction.find(factionId);
+    return it == bountyVoucherByFaction.end() ? 0.0 : std::max(0.0, it->second);
+  };
+
+  auto addVoucher = [&](core::u32 factionId, double deltaCr) {
+    if (factionId == 0) return;
+    bountyVoucherByFaction[factionId] = std::max(0.0, getVoucher(factionId) + deltaCr);
+  };
+
+  auto clearVoucher = [&](core::u32 factionId) {
+    if (factionId == 0) return;
+    bountyVoucherByFaction[factionId] = 0.0;
+  };
 
 auto commitCrime = [&](core::u32 factionId, double bountyAddCr, double repPenalty, const std::string& reason, bool showToast = true) {
   if (factionId == 0) return;
@@ -1185,6 +1298,12 @@ const auto scanKeyPlanet = [&](sim::SystemId sysId, std::size_t planetIndex) -> 
 const auto scanKeyStation = [&](sim::StationId stId) -> core::u64 {
   return core::hashCombine((core::u64)stId, 0x53544154ULL); // 'STAT'
 };
+	const auto scanKeySignal = [&](core::u64 signalId) -> core::u64 {
+	  return core::hashCombine((core::u64)signalId, 0x5349474EULL); // 'SIGN'
+	};
+	const auto scanKeyAsteroid = [&](core::u64 asteroidId) -> core::u64 {
+	  return core::hashCombine((core::u64)asteroidId, 0x41535452ULL); // 'ASTR'
+	};
 const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   return core::hashCombine((core::u64)sysId, 0x434F4D50ULL); // 'COMP'
 };
@@ -1356,6 +1475,44 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     toast(toasts, "FSD charging...", 2.0);
   };
 
+  // --- Gameplay helpers ---
+  auto cargoValueEstimateCr = [&]() -> double {
+    double v = 0.0;
+    for (int i = 0; i < (int)econ::CommodityId::COUNT; ++i) {
+      const auto cid = (econ::CommodityId)i;
+      const double units = cargo[i];
+      if (units <= 0.0) continue;
+      v += units * econ::commodityDef(cid).basePrice;
+    }
+    return v;
+  };
+
+  auto spawnCargoPod = [&](econ::CommodityId cid, double units, const math::Vec3d& posKm,
+                          const math::Vec3d& inheritVelKmS) {
+    if (units <= 0.0) return;
+    FloatingCargo pod{};
+    pod.id = allocWorldId();
+    pod.commodity = cid;
+    pod.units = units;
+    pod.posKm = posKm;
+    pod.velKmS = inheritVelKmS + randUnit() * rng.range(0.0, 1.2);
+    pod.expireDay = timeDays + (rng.range(8.0 * 60.0, 18.0 * 60.0) / 86400.0); // 8–18 min
+    floatingCargo.push_back(pod);
+  };
+
+  auto spawnCargoBurst = [&](econ::CommodityId cid, double totalUnits, const math::Vec3d& posKm,
+                            const math::Vec3d& inheritVelKmS, int pods) {
+    pods = std::max(1, std::min(pods, 6));
+    totalUnits = std::max(0.0, totalUnits);
+    if (totalUnits <= 0.0) return;
+    const double per = totalUnits / (double)pods;
+    for (int i = 0; i < pods; ++i) {
+      // Small random split so the last pod isn't always tiny.
+      const double u = (i == pods - 1) ? (totalUnits - per * (pods - 1)) : (per * rng.range(0.75, 1.25));
+      spawnCargoPod(cid, std::max(0.0, u), posKm, inheritVelKmS);
+    }
+  };
+
   bool running = true;
   auto last = std::chrono::high_resolution_clock::now();
 
@@ -1411,24 +1568,49 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
         hit.alive = false;
 
-        if (deadRole == ContactRole::Pirate) {
-          const double bountyCr = 450.0;
-          credits += bountyCr;
-          toast(toasts, "Pirate destroyed. +" + std::to_string((int)bountyCr) + " cr", 2.5);
+	        const math::Vec3d deadPos = hit.ship.positionKm();
+	        const math::Vec3d deadVel = hit.ship.velocityKmS();
 
-          const core::u32 lf = currentSystem ? currentSystem->stub.factionId : 0;
-          if (lf != 0) addRep(lf, +0.5);
-        } else if (deadRole == ContactRole::Trader) {
-          // Piracy payout (simplified as immediate credits)
-          const double payout = std::max(0.0, lootCr);
-          credits += payout;
-          toast(toasts, "Trader destroyed. Loot +" + std::to_string((int)payout) + " cr (WANTED!)", 3.0);
+	        if (deadRole == ContactRole::Pirate) {
+	          // Bounty vouchers: redeemed at stations (ties combat -> station loop).
+	          const core::u32 authority = currentSystem ? currentSystem->stub.factionId : 0;
+	          const double bountyCr = 450.0;
+	          if (authority != 0) {
+	            addVoucher(authority, bountyCr);
+	            toast(toasts, "Pirate destroyed. Bounty voucher +" + std::to_string((int)bountyCr) + " cr", 2.5);
+	            addRep(authority, +0.5);
+	          } else {
+	            credits += bountyCr;
+	            toast(toasts, "Pirate destroyed. +" + std::to_string((int)bountyCr) + " cr", 2.5);
+	          }
 
-          commitCrime(deadFaction, 1200.0, -18.0, "Murder of trader");
-        } else if (deadRole == ContactRole::Police) {
-          toast(toasts, "Security destroyed. (WANTED!)", 3.0);
-          commitCrime(deadFaction, 2500.0, -35.0, "Murder of security");
-        }
+	          // Salvage: pirates drop a few cargo pods.
+	          static constexpr econ::CommodityId kPirateLoot[] = {
+	            econ::CommodityId::Ore,
+	            econ::CommodityId::Metals,
+	            econ::CommodityId::Machinery,
+	            econ::CommodityId::Electronics,
+	            econ::CommodityId::Fuel,
+	            econ::CommodityId::Luxury,
+	          };
+	          const int pods = rng.range<int>(1, 3);
+	          for (int i = 0; i < pods; ++i) {
+	            const auto cid = kPirateLoot[rng.range<int>(0, (int)std::size(kPirateLoot) - 1)];
+	            const double units = (double)rng.range<int>(4, 14);
+	            spawnCargoPod(cid, units, deadPos, deadVel);
+	          }
+	        } else if (deadRole == ContactRole::Trader) {
+	          // Traders drop their carried commodity as pods (ties piracy -> scooping loop).
+	          const double totalUnits = std::max(0.0, hit.tradeUnits * 0.75);
+	          if (totalUnits > 0.0) {
+	            spawnCargoBurst(hit.tradeCommodity, totalUnits, deadPos, deadVel, rng.range<int>(2, 4));
+	          }
+	          toast(toasts, "Trader destroyed. Cargo pods ejected. (WANTED!)", 3.0);
+	          commitCrime(deadFaction, 1200.0, -18.0, "Murder of trader");
+	        } else if (deadRole == ContactRole::Police) {
+	          toast(toasts, "Security destroyed. (WANTED!)", 3.0);
+	          commitCrime(deadFaction, 2500.0, -35.0, "Murder of security");
+	        }
 
         // Bounty kill missions (pirate targets)
         for (auto& m : missions) {
@@ -1482,8 +1664,9 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           s.thrusterMk = (core::u8)std::clamp(thrusterMk, 1, 3);
           s.shieldMk = (core::u8)std::clamp(shieldMk, 1, 3);
           s.distributorMk = (core::u8)std::clamp(distributorMk, 1, 3);
-          s.weaponPrimary = (core::u8)std::clamp((int)weaponPrimary, 0, 3);
-          s.weaponSecondary = (core::u8)std::clamp((int)weaponSecondary, 0, 3);
+	          const int maxWeaponIdx = (int)std::size(kWeaponDefs) - 1;
+	          s.weaponPrimary = (core::u8)std::clamp((int)weaponPrimary, 0, maxWeaponIdx);
+	          s.weaponSecondary = (core::u8)std::clamp((int)weaponSecondary, 0, maxWeaponIdx);
 
           s.nextMissionId = nextMissionId;
           s.missions = missions;
@@ -1501,15 +1684,19 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             r.rep = kv.second;
             s.reputation.push_back(r);
           }
-          s.stationOverrides = universe.exportStationOverrides();
-// Exploration / law
-s.explorationDataCr = explorationDataCr;
-s.scannedKeys.assign(scannedKeys.begin(), scannedKeys.end());
-s.bounties.clear();
-for (const auto& [fid, b] : bountyByFaction) {
-  if (b > 0.0) s.bounties.push_back({fid, b});
-}
+	          s.stationOverrides = universe.exportStationOverrides();
 
+	          // Exploration / law
+	          s.explorationDataCr = explorationDataCr;
+	          s.scannedKeys.assign(scannedKeys.begin(), scannedKeys.end());
+	          s.bounties.clear();
+	          for (const auto& [fid, b] : bountyByFaction) {
+	            if (b > 0.0) s.bounties.push_back({fid, b});
+	          }
+	          s.bountyVouchers.clear();
+	          for (const auto& [fid, v] : bountyVoucherByFaction) {
+	            if (v > 0.0) s.bountyVouchers.push_back({fid, v});
+	          }
 
           if (sim::saveToFile(s, savePath)) {
             toast(toasts, "Saved to " + savePath, 2.5);
@@ -1547,8 +1734,9 @@ for (const auto& [fid, b] : bountyByFaction) {
             thrusterMk = std::clamp((int)s.thrusterMk, 1, 3);
             shieldMk = std::clamp((int)s.shieldMk, 1, 3);
             distributorMk = std::clamp((int)s.distributorMk, 1, 3);
-            weaponPrimary = (WeaponType)std::clamp((int)s.weaponPrimary, 0, 3);
-            weaponSecondary = (WeaponType)std::clamp((int)s.weaponSecondary, 0, 3);
+	            const int maxWeaponIdx = (int)std::size(kWeaponDefs) - 1;
+	            weaponPrimary = (WeaponType)std::clamp((int)s.weaponPrimary, 0, maxWeaponIdx);
+	            weaponSecondary = (WeaponType)std::clamp((int)s.weaponSecondary, 0, maxWeaponIdx);
             recalcPlayerStats();
 
             playerHull = std::clamp(s.hull, 0.0, 1.0) * playerHullMax;
@@ -1563,17 +1751,20 @@ for (const auto& [fid, b] : bountyByFaction) {
             missionOffersDayStamp = s.missionOffersDayStamp;
             missionOffers = s.missionOffers;
 
-            repByFaction.clear();
-            for (const auto& r : s.reputation) repByFaction[r.factionId] = r.rep;
+	            repByFaction.clear();
+	            for (const auto& r : s.reputation) repByFaction[r.factionId] = r.rep;
 
-// Exploration / law
-explorationDataCr = s.explorationDataCr;
-scannedKeys.clear();
-for (core::u64 k : s.scannedKeys) scannedKeys.insert(k);
+	            // Exploration / law
+	            explorationDataCr = s.explorationDataCr;
+	            scannedKeys.clear();
+	            for (core::u64 k : s.scannedKeys) scannedKeys.insert(k);
 
-bountyByFaction.clear();
-for (const auto& b : s.bounties) bountyByFaction[b.factionId] = b.bountyCr;
-policeAlertUntilDays = 0.0;
+	            bountyByFaction.clear();
+	            for (const auto& b : s.bounties) bountyByFaction[b.factionId] = b.bountyCr;
+	            bountyVoucherByFaction.clear();
+	            for (const auto& v : s.bountyVouchers) bountyVoucherByFaction[v.factionId] = v.bountyCr;
+	            policeAlertUntilDays = 0.0;
+	            policeDemand = PoliceDemand{};
 
             docked = (s.dockedStation != 0);
             dockedStationId = s.dockedStation;
@@ -1587,9 +1778,20 @@ policeAlertUntilDays = 0.0;
             // clear transient runtime things
             contacts.clear();
             beams.clear();
-          nextPirateSpawnDays = timeDays + (rng.range(25.0, 55.0) / 86400.0);
-          nextTraderSpawnDays = timeDays + (rng.range(15.0, 35.0) / 86400.0);
-          nextPoliceSpawnDays = timeDays + (rng.range(10.0, 25.0) / 86400.0);
+            projectiles.clear();
+
+            floatingCargo.clear();
+            asteroids.clear();
+            signals.clear();
+            nextWorldObjectId = 1;
+            nextSignalSpawnDays = timeDays + 0.01;
+            nextSupercruiseShadowSpawnDays = timeDays + 0.01;
+            cargoScoopDeployed = true;
+            cargoFullToastCooldownUntilDays = 0.0;
+
+            nextPirateSpawnDays = timeDays + (rng.range(25.0, 55.0) / 86400.0);
+            nextTraderSpawnDays = timeDays + (rng.range(15.0, 35.0) / 86400.0);
+            nextPoliceSpawnDays = timeDays + (rng.range(10.0, 25.0) / 86400.0);
             autopilot = false;
             supercruiseState = SupercruiseState::Idle;
             supercruiseChargeRemainingSec = 0.0;
@@ -1634,6 +1836,85 @@ policeAlertUntilDays = 0.0;
           autopilot = !autopilot;
           autopilotPhase = 0;
         }
+
+	        if (event.key.keysym.sym == SDLK_o) {
+	          if (!io.WantCaptureKeyboard) {
+	            cargoScoopDeployed = !cargoScoopDeployed;
+	            toast(toasts,
+	                  std::string("Cargo scoop ") + (cargoScoopDeployed ? "DEPLOYED" : "RETRACTED") + " (O)",
+	                  1.8);
+	          }
+	        }
+
+	        if (event.key.keysym.sym == SDLK_v) {
+	          if (!io.WantCaptureKeyboard && !docked && currentSystem) {
+	            // Cycle targets across signal sources, cargo pods, and asteroid nodes.
+	            struct Cand {
+	              TargetKind kind;
+	              std::size_t idx;
+	              double distKm;
+	            };
+	            std::vector<Cand> cands;
+	            cands.reserve(signals.size() + floatingCargo.size() + asteroids.size());
+	            const math::Vec3d p = ship.positionKm();
+	            for (std::size_t i = 0; i < signals.size(); ++i) {
+	              if (timeDays > signals[i].expireDay) continue;
+	              cands.push_back({TargetKind::Signal, i, (signals[i].posKm - p).length()});
+	            }
+	            for (std::size_t i = 0; i < floatingCargo.size(); ++i) {
+	              cands.push_back({TargetKind::Cargo, i, (floatingCargo[i].posKm - p).length()});
+	            }
+	            for (std::size_t i = 0; i < asteroids.size(); ++i) {
+	              if (asteroids[i].remainingUnits <= 0.0) continue;
+	              cands.push_back({TargetKind::Asteroid, i, (asteroids[i].posKm - p).length()});
+	            }
+	            if (cands.empty()) {
+	              toast(toasts, "No signal sources / salvage / asteroids detected.", 1.8);
+	            } else {
+	              std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.distKm < b.distKm; });
+	              std::size_t pick = 0;
+	              for (std::size_t i = 0; i < cands.size(); ++i) {
+	                if (target.kind == cands[i].kind && target.index == cands[i].idx) {
+	                  pick = (i + 1) % cands.size();
+	                  break;
+	                }
+	              }
+	              target.kind = cands[pick].kind;
+	              target.index = cands[pick].idx;
+	            }
+	          }
+	        }
+
+	        if (event.key.keysym.sym == SDLK_i) {
+	          if (!io.WantCaptureKeyboard && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
+		            if (policeDemand.active && timeDays < policeDemand.untilDays) {
+	              const core::u32 fid = policeDemand.factionId;
+	              const double owed = getBounty(fid);
+	              const double pay = std::min(credits, owed);
+	              if (pay > 0.0) {
+	                credits -= pay;
+	                addBounty(fid, -pay);
+	              }
+	              const double remaining = getBounty(fid);
+		              if (remaining <= 0.0) {
+	                clearBounty(fid);
+	                policeAlertUntilDays = timeDays;
+	                toast(toasts, "Submitted. Bounty paid: CLEAN.", 2.4);
+		                policeDemand = PoliceDemand{};
+		              } else {
+	                toast(toasts,
+	                      "Submitted. Partial payment " + std::to_string((int)pay) + " cr. Remaining bounty " + std::to_string((int)remaining) + " cr.",
+	                      3.0);
+		                // Unable to settle: authorities will escalate immediately.
+		                policeDemand.active = false;
+		                policeDemand.untilDays = timeDays;
+		                policeDemand.amountCr = remaining;
+	              }
+		            } else {
+		              toast(toasts, "No active authority demand to submit to.", 1.8);
+	            }
+	          }
+	        }
 
         if (event.key.keysym.sym == SDLK_m) {
           if (!io.WantCaptureKeyboard) {
@@ -1749,6 +2030,20 @@ policeAlertUntilDays = 0.0;
                   scanRangeKm = 1.0e18; // anywhere in-system for now
                   scanLabel = std::string("Star scan: ") + starClassName(currentSystem->star.cls);
                   ok = true;
+	                } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
+	                  const auto& s = signals[target.index];
+	                  scanLockedId = s.id;
+	                  scanDurationSec = 4.0;
+	                  scanRangeKm = 120000.0;
+	                  scanLabel = std::string("Signal scan: ") + signalTypeName(s.type);
+	                  ok = true;
+	                } else if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
+	                  const auto& a = asteroids[target.index];
+	                  scanLockedId = a.id;
+	                  scanDurationSec = 4.5;
+	                  scanRangeKm = std::max(140000.0, a.radiusKm * 55.0);
+	                  scanLabel = std::string("Prospect asteroid: ") + econ::commodityDef(a.yield).name;
+	                  ok = true;
                 }
 
                 if (ok) {
@@ -1928,7 +2223,6 @@ if (event.key.keysym.sym == SDLK_y) {
           const bool primary = (event.button.button == SDL_BUTTON_LEFT);
 
           const WeaponType wType = primary ? weaponPrimary : weaponSecondary;
-          lastFiredWeapon = wType;
           const WeaponDef& w = weaponDef(wType);
 
           double& cd = primary ? weaponPrimaryCooldown : weaponSecondaryCooldown;
@@ -1949,10 +2243,10 @@ if (event.key.keysym.sym == SDLK_y) {
               const math::Vec3d aKm = ship.positionKm();
               const math::Vec3d dir = ship.forward().normalized();
 
-              // Find best hit (simple cone + nearest along ray).
-              int bestIdx = -1;
-              double bestT = rangeKm;
-              const double cone = (wType == WeaponType::PulseLaser) ? 0.993 : 0.995;
+	              // Find best hit (contacts: simple cone + nearest along ray, asteroids: sphere intersection).
+	              int bestIdx = -1;
+	              double bestT = rangeKm;
+	              const double cone = (wType == WeaponType::PulseLaser) ? 0.993 : 0.995;
 
               for (int i = 0; i < (int)contacts.size(); ++i) {
                 auto& c = contacts[(std::size_t)i];
@@ -1970,10 +2264,46 @@ if (event.key.keysym.sym == SDLK_y) {
                 if (t < bestT) { bestT = t; bestIdx = i; }
               }
 
-              const math::Vec3d bKm = aKm + dir * bestT;
-              beams.push_back({toRenderU(aKm), toRenderU(bKm), w.r, w.g, w.b, 0.10});
+	              // Asteroid hit test
+	              int bestAstIdx = -1;
+	              double bestAstT = rangeKm;
+	              for (int i = 0; i < (int)asteroids.size(); ++i) {
+	                const auto& a = asteroids[(std::size_t)i];
+	                const math::Vec3d toCenter = a.posKm - aKm;
+	                const double tProj = math::dot(toCenter, dir);
+	                if (tProj < 0.0 || tProj > rangeKm) continue;
+	                const math::Vec3d closest = aKm + dir * tProj;
+	                const double d2 = (a.posKm - closest).lengthSq();
+	                const double r2 = a.radiusKm * a.radiusKm;
+	                if (d2 > r2) continue;
+	                const double thc = std::sqrt(std::max(0.0, r2 - d2));
+	                const double tHit = std::clamp(tProj - thc, 0.0, rangeKm);
+	                if (tHit < bestAstT) { bestAstT = tHit; bestAstIdx = i; }
+	              }
 
-              if (bestIdx >= 0) playerDamageContact(bestIdx, dmg);
+	              // Choose nearest along the ray.
+	              const bool hitAsteroidFirst = (bestAstIdx >= 0 && bestAstT <= bestT);
+	              const double finalT = hitAsteroidFirst ? bestAstT : bestT;
+	              const math::Vec3d bKm = aKm + dir * finalT;
+	              beams.push_back({toRenderU(aKm), toRenderU(bKm), w.r, w.g, w.b, 0.10});
+
+	              if (hitAsteroidFirst) {
+	                if (wType == WeaponType::MiningLaser) {
+	                  auto& a = asteroids[(std::size_t)bestAstIdx];
+	                  if (a.remainingUnits > 1e-6) {
+	                    const double chunk = std::min(a.remainingUnits, rng.range(6.0, 14.0));
+	                    a.remainingUnits -= chunk;
+	                    spawnCargoPod(a.yield, chunk, bKm, math::Vec3d{0,0,0}, 0.45);
+	                    toast(toasts,
+	                          std::string("Mined ") + econ::commodityDef(a.yield).name + " x" + std::to_string((int)std::round(chunk)),
+	                          2.0);
+	                  } else {
+	                    toast(toasts, "Asteroid depleted.", 1.5);
+	                  }
+	                }
+	              } else {
+	                if (bestIdx >= 0) playerDamageContact(bestIdx, dmg);
+	              }
             } else {
               const double muzzleSpeedKmS = std::max(1e-6, w.projSpeedKmS);
               const double rangeKm = w.rangeKm;
@@ -2202,6 +2532,15 @@ if (event.key.keysym.sym == SDLK_y) {
       const double approachSpeed = emergency ? 0.45 : 0.16;
       ship.setVelocityKmS(destVelKmS + dirToDest * approachSpeed);
 
+	      // Detach any supercruise "shadow" contacts so they remain nearby in normal space.
+	      for (auto& c : contacts) {
+	        if (!c.alive || !c.supercruiseShadow) continue;
+	        c.supercruiseShadow = false;
+	        c.shadowOffsetLocalKm = {0,0,0};
+	        c.ship.setVelocityKmS(ship.velocityKmS() + math::Vec3d{rng.range(-0.08, 0.08), rng.range(-0.08, 0.08), rng.range(-0.08, 0.08)});
+	        c.ship.setAngularVelocityRadS({0,0,0});
+	      }
+
       if (emergency) {
         heat = std::min(120.0, heat + 25.0);
         playerShield = std::max(0.0, playerShield - playerShieldMax * 0.12);
@@ -2215,7 +2554,87 @@ if (event.key.keysym.sym == SDLK_y) {
     };
 
     if (supercruiseState == SupercruiseState::Active && !docked && !captureKeys && fsdState == FsdState::Idle) {
-      // Determine destination (station or planet)
+	      // Keep supercruise "shadow" contacts tethered to the player.
+	      for (auto& c : contacts) {
+	        if (!c.alive || !c.supercruiseShadow) continue;
+	        const math::Vec3d offWorld = ship.orientation().rotate(c.shadowOffsetLocalKm);
+	        c.ship.setPositionKm(ship.positionKm() + offWorld);
+	        c.ship.setVelocityKmS(ship.velocityKmS());
+	        c.ship.setAngularVelocityRadS({0,0,0});
+	      }
+
+	      // Spawn occasional supercruise encounters (pirate shadows on valuable cargo routes;
+	      // police shadows if you're wanted in this jurisdiction).
+	      if (currentSystem && timeDays >= nextSupercruiseShadowSpawnDays) {
+	        nextSupercruiseShadowSpawnDays = timeDays + (rng.range(55.0, 95.0) / 86400.0);
+	        const core::u32 jurisdiction = currentSystem->stub.factionId;
+	        const double cargoV = cargoValueEstimateCr();
+	        const bool wantedHere = (jurisdiction != 0) && (getBounty(jurisdiction) > 0.0);
+
+	        int shadowPirates = 0;
+	        int shadowPolice = 0;
+	        for (const auto& c : contacts) {
+	          if (!c.alive || !c.supercruiseShadow) continue;
+	          if (c.role == ContactRole::Pirate) shadowPirates++;
+	          if (c.role == ContactRole::Police) shadowPolice++;
+	        }
+
+	        // Pirates are more likely to show up the more valuable your cargo is.
+	        if (shadowPirates < 1 && cargoV > 2500.0 && timeDays >= interdictionCooldownUntilDays) {
+	          const double risk = std::clamp(cargoV / 9000.0, 0.0, 1.5);
+	          const double chance = std::clamp(0.20 + 0.35 * risk, 0.0, 0.75);
+	          if (rng.nextUnit() < chance) {
+	            Contact p{};
+	            p.id = allocWorldId();
+	            p.role = ContactRole::Pirate;
+	            p.name = "Pirate " + std::to_string((int)contacts.size() + 1);
+	            p.ship.setMaxLinearAccelKmS2(0.06);
+	            p.ship.setMaxAngularAccelRadS2(0.9);
+	            p.hostileToPlayer = true;
+	            p.supercruiseShadow = true;
+	            // Keep them behind you so they can pressure an interdiction.
+	            p.shadowOffsetLocalKm = {rng.range(-25000.0, 25000.0), rng.range(-12000.0, 12000.0), -rng.range(165000.0, 220000.0)};
+	            p.ship.setPositionKm(ship.positionKm() + ship.orientation().rotate(p.shadowOffsetLocalKm));
+	            p.ship.setVelocityKmS(ship.velocityKmS());
+	            p.ship.setOrientation(ship.orientation());
+	            p.ship.setAngularVelocityRadS({0,0,0});
+	            p.shield = npcShieldMax;
+	            p.shieldMax = npcShieldMax;
+	            p.shieldRegenPerSec = npcShieldRegenPerSec;
+	            p.hull = npcHullMax;
+	            p.hullMax = npcHullMax;
+	            contacts.push_back(std::move(p));
+	            toast(toasts, "Contact: pirate wake signature detected!", 2.8);
+	          }
+	        }
+
+	        // If you're wanted, law enforcement can follow you through supercruise and be waiting on drop.
+	        if (wantedHere && shadowPolice < 1) {
+	          if (rng.nextUnit() < 0.55) {
+	            Contact pc{};
+	            pc.id = allocWorldId();
+	            pc.role = ContactRole::Police;
+	            pc.factionId = jurisdiction;
+	            pc.name = "Police";
+	            pc.ship.setMaxLinearAccelKmS2(0.07);
+	            pc.ship.setMaxAngularAccelRadS2(1.0);
+	            pc.supercruiseShadow = true;
+	            pc.shadowOffsetLocalKm = {rng.range(-22000.0, 22000.0), rng.range(-10000.0, 10000.0), -rng.range(140000.0, 200000.0)};
+	            pc.ship.setPositionKm(ship.positionKm() + ship.orientation().rotate(pc.shadowOffsetLocalKm));
+	            pc.ship.setVelocityKmS(ship.velocityKmS());
+	            pc.ship.setOrientation(ship.orientation());
+	            pc.ship.setAngularVelocityRadS({0,0,0});
+	            pc.shield = npcShieldMax;
+	            pc.shieldMax = npcShieldMax;
+	            pc.shieldRegenPerSec = npcShieldRegenPerSec;
+	            pc.hull = npcHullMax;
+	            pc.hullMax = npcHullMax;
+	            contacts.push_back(std::move(pc));
+	          }
+	        }
+	      }
+
+	      // Determine destination (station / planet / signal source)
       bool hasDest = false;
       math::Vec3d destPosKm{0,0,0};
       math::Vec3d destVelKmS{0,0,0};
@@ -2234,6 +2653,12 @@ if (event.key.keysym.sym == SDLK_y) {
         const double rKm = p.radiusEarth * 6371.0;
         dropKm = std::max(60000.0, rKm * 12.0);
         hasDest = true;
+	      } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
+	        const auto& s = signals[target.index];
+	        destPosKm = s.posKm;
+	        destVelKmS = {0, 0, 0};
+	        dropKm = 70000.0;
+	        hasDest = true;
       }
 
       math::Vec3d dirToDest = ship.forward().normalized();
@@ -2243,7 +2668,37 @@ if (event.key.keysym.sym == SDLK_y) {
         if (dist > 1e-6) dirToDest = rel / dist;
       }
 
-      // Interdiction (very early, but clearer + playable than the old "instant drop")
+	      // Spawn intermittent signal sources while travelling in supercruise.
+	      if (currentSystem && hasDest && timeDays >= nextSignalSpawnDays && signals.size() < 10) {
+	        nextSignalSpawnDays = timeDays + (rng.range(55.0, 120.0) / 86400.0);
+
+	        const double r = rng.nextUnit();
+	        SignalType t = SignalType::Distress;
+	        if (r < 0.55) t = SignalType::Distress;
+	        else if (r < 0.82) t = SignalType::Derelict;
+	        else t = SignalType::Resource;
+
+	        // Place the signal somewhere ahead along the line to the destination, with some lateral offset.
+	        const double aheadKm = rng.range(200000.0, 520000.0);
+	        math::Vec3d side = math::cross(dirToDest, randUnit());
+	        if (side.length() < 1e-6) side = math::cross(dirToDest, math::Vec3d{0,1,0});
+	        side = side.normalized();
+	        const double sideKm = rng.range(-140000.0, 140000.0);
+	        math::Vec3d pos = ship.positionKm() + dirToDest * aheadKm + side * sideKm;
+
+	        SignalSource s;
+	        s.id = allocWorldId();
+	        s.type = t;
+	        s.posKm = pos;
+	        s.expireDay = timeDays + rng.range(0.010, 0.030); // ~14-43 minutes (sim-days)
+	        s.resolved = false;
+	        s.fieldSpawned = false;
+	        signals.push_back(s);
+
+	        toast(toasts, std::string("Signal detected: ") + signalTypeName(t), 3.0);
+	      }
+
+	      // Interdiction (very early, but clearer + playable than the old "instant drop")
       double nearestPirateKm = 1e99;
       core::u64 nearestPirateId = 0;
       std::string nearestPirateName;
@@ -2447,12 +2902,19 @@ if (event.key.keysym.sym == SDLK_y) {
           clearances.clear();
           contacts.clear();
           beams.clear();
+	          floatingCargo.clear();
+	          signals.clear();
+	          asteroids.clear();
+	          policeDemand = PoliceDemand{};
           scanning = false;
           scanProgressSec = 0.0;
           scanLockedId = 0;
           scanLabel.clear();
           scanLockedTarget = Target{};
           target = Target{};
+	          seedSystemSpaceObjects(*currentSystem);
+	          nextSignalSpawnDays = timeDays + (rng.range(35.0, 70.0) / 86400.0);
+	          nextSupercruiseShadowSpawnDays = timeDays + (rng.range(45.0, 90.0) / 86400.0);
 
           // Spawn near the first station.
           respawnNearStation(*currentSystem, 0);
@@ -3036,67 +3498,76 @@ for (const auto& c : contacts) {
 
     // ---- POLICE ----
     if (c.role == ContactRole::Police) {
-      // Police engage if you're wanted here, or if you attacked security.
-      const bool hostile = c.hostileToPlayer || (c.factionId != 0 && getBounty(c.factionId) > 0.0) || (c.factionId != 0 && getRep(c.factionId) < -45.0);
+	      const double bountyHere = (c.factionId != 0) ? getBounty(c.factionId) : 0.0;
+	      const bool wantedHere = bountyHere > 1e-6;
+	      const bool repHostile = (c.factionId != 0) && (getRep(c.factionId) < -45.0);
+	      const bool hostile = c.hostileToPlayer || repHostile || wantedHere;
 
-      // If not hostile to player, try to engage pirates near the player.
-      std::optional<std::size_t> pirateIdx{};
-      if (!hostile) {
-        pirateIdx = nearestPirateIndex(c.ship.positionKm(), 140000.0);
-      }
+	      // If you're wanted, police will try to scan and demand compliance before firing (unless you attacked them).
+	      const bool demandExpired = wantedHere && (policeDemand.factionId == c.factionId) && !policeDemand.active
+	                                && (policeDemand.untilDays > 0.0) && (timeDays >= policeDemand.untilDays);
+	      const bool holdFireForDemand = wantedHere && !c.hostileToPlayer && !demandExpired;
+	      const bool holdFireForScan = !c.hostileToPlayer && cargoScanActive && (cargoScanFactionId == c.factionId);
+	      const bool canFireAtPlayer = hostile && !(holdFireForDemand || holdFireForScan);
 
-      sim::ShipInput ai{};
-      if (hostile) {
-        chaseTarget(c.ship, ai, ship.positionKm(), ship.velocityKmS(), 42000.0, 0.26, 2.0);
-      } else if (pirateIdx) {
-        const auto& p = contacts[*pirateIdx];
-        chaseTarget(c.ship, ai, p.ship.positionKm(), p.ship.velocityKmS(), 42000.0, 0.26, 2.0);
-      } else if (currentSystem && !currentSystem->stations.empty()) {
-        // Patrol around home station.
-        const auto& st = currentSystem->stations[std::min(c.homeStationIndex, currentSystem->stations.size()-1)];
-        const math::Vec3d stPos = stationPosKm(st, timeDays);
-        const double baseR = st.radiusKm * 22.0;
-        const double ang = std::fmod((double)(c.id % 1000) * 0.012 + timeDays * 1.10, 2.0 * math::kPi);
-        const math::Vec3d offset = math::Vec3d{std::cos(ang), 0.10*std::sin(ang*0.6), std::sin(ang)} * baseR;
-        chaseTarget(c.ship, ai, stPos + offset, stationVelKmS(st, timeDays), baseR * 0.6, 0.20, 1.6);
-      }
+	      // If not hostile to player, try to engage pirates near the player.
+	      std::optional<std::size_t> pirateIdx{};
+	      if (!hostile) {
+	        pirateIdx = nearestPirateIndex(c.ship.positionKm(), 140000.0);
+	      }
 
-      c.ship.step(dtSim, ai);
+	      sim::ShipInput ai{};
+	      if (hostile) {
+	        chaseTarget(c.ship, ai, ship.positionKm(), ship.velocityKmS(), 42000.0, 0.26, 2.0);
+	      } else if (pirateIdx) {
+	        const auto& p = contacts[*pirateIdx];
+	        chaseTarget(c.ship, ai, p.ship.positionKm(), p.ship.velocityKmS(), 42000.0, 0.26, 2.0);
+	      } else if (currentSystem && !currentSystem->stations.empty()) {
+	        // Patrol around home station.
+	        const auto& st = currentSystem->stations[std::min(c.homeStationIndex, currentSystem->stations.size()-1)];
+	        const math::Vec3d stPos = stationPosKm(st, timeDays);
+	        const double baseR = st.radiusKm * 22.0;
+	        const double ang = std::fmod((double)(c.id % 1000) * 0.012 + timeDays * 1.10, 2.0 * math::kPi);
+	        const math::Vec3d offset = math::Vec3d{std::cos(ang), 0.10*std::sin(ang*0.6), std::sin(ang)} * baseR;
+	        chaseTarget(c.ship, ai, stPos + offset, stationVelKmS(st, timeDays), baseR * 0.6, 0.20, 1.6);
+	      }
 
-      // Fire if aligned (at player OR pirate target).
-      const math::Vec3d targetPos = hostile ? ship.positionKm()
-                                            : (pirateIdx ? contacts[*pirateIdx].ship.positionKm() : math::Vec3d{0,0,0});
-      const bool hasTarget = hostile || (bool)pirateIdx;
-      if (hasTarget) {
-        const math::Vec3d to = targetPos - c.ship.positionKm();
-        const double dist = to.length();
-        if (c.fireCooldown <= 0.0 && dist < 95000.0) {
-          const math::Vec3d toN = (dist > 1e-6) ? (to / dist) : math::Vec3d{0,0,1};
-          const double aim = math::dot(c.ship.forward().normalized(), toN);
-          if (aim > 0.993) {
-            c.fireCooldown = 0.28;
-            const double dmg = 12.0;
+	      c.ship.step(dtSim, ai);
 
-            if (hostile) {
-              applyDamage(dmg, playerShield, playerHull);
-              const math::Vec3d aKm = c.ship.positionKm();
-              const math::Vec3d bKm = ship.positionKm();
-              beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.35f, 0.75f, 1.0f, 0.07});
-            } else if (pirateIdx) {
-              auto& p = contacts[*pirateIdx];
-              applyDamage(dmg, p.shield, p.hull);
-              const math::Vec3d aKm = c.ship.positionKm();
-              const math::Vec3d bKm = p.ship.positionKm();
-              beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.35f, 0.75f, 1.0f, 0.07});
-              if (p.hull <= 0.0) {
-                p.alive = false;
-                credits += 180.0;
-                toast(toasts, "Security destroyed a pirate (+180).", 2.0);
-              }
-            }
-          }
-        }
-      }
+	      // Fire if aligned (at player OR pirate target).
+	      const math::Vec3d targetPos = canFireAtPlayer ? ship.positionKm()
+	                                                    : (pirateIdx ? contacts[*pirateIdx].ship.positionKm() : math::Vec3d{0,0,0});
+	      const bool hasTarget = canFireAtPlayer || (bool)pirateIdx;
+	      if (hasTarget) {
+	        const math::Vec3d to = targetPos - c.ship.positionKm();
+	        const double dist = to.length();
+	        if (c.fireCooldown <= 0.0 && dist < 95000.0) {
+	          const math::Vec3d toN = (dist > 1e-6) ? (to / dist) : math::Vec3d{0,0,1};
+	          const double aim = math::dot(c.ship.forward().normalized(), toN);
+	          if (aim > 0.993) {
+	            c.fireCooldown = 0.28;
+	            const double dmg = 12.0;
+
+	            if (canFireAtPlayer) {
+	              applyDamage(dmg, playerShield, playerHull);
+	              const math::Vec3d aKm = c.ship.positionKm();
+	              const math::Vec3d bKm = ship.positionKm();
+	              beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.35f, 0.75f, 1.0f, 0.07});
+	            } else if (pirateIdx) {
+	              auto& p = contacts[*pirateIdx];
+	              applyDamage(dmg, p.shield, p.hull);
+	              const math::Vec3d aKm = c.ship.positionKm();
+	              const math::Vec3d bKm = p.ship.positionKm();
+	              beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.35f, 0.75f, 1.0f, 0.07});
+	              if (p.hull <= 0.0) {
+	                p.alive = false;
+	                credits += 180.0;
+	                toast(toasts, "Security destroyed a pirate (+180).", 2.0);
+	              }
+	            }
+	          }
+	        }
+	      }
       continue;
     }
   }
@@ -3126,11 +3597,14 @@ for (const auto& c : contacts) {
       }
     }
 
-    // Station security vs wanted player
-    if (st.factionId != 0 && getBounty(st.factionId) > 0.0) {
-      // very light pressure - enough to create urgency without insta-kill
-      applyDamage(1.5 * dtSim, playerShield, playerHull);
-    }
+	    // Station security vs wanted player
+	    if (st.factionId != 0 && getBounty(st.factionId) > 0.0) {
+	      const bool holdFire = (policeDemand.factionId == st.factionId && policeDemand.active && timeDays < policeDemand.untilDays);
+	      if (!holdFire) {
+	        // very light pressure - enough to create urgency without insta-kill
+	        applyDamage(1.5 * dtSim, playerShield, playerHull);
+	      }
+	    }
   }
 }
 
@@ -3163,68 +3637,7 @@ for (const auto& c : contacts) {
 
             ship.setPositionKm(ship.positionKm() + stQ.rotate(pushLocal));
             ship.setVelocityKmS(stV); // kill relative motion on impact
-            if (collisionToastCooldownSec <= 0.0) {
-              toast(toasts, "Collision!", 1.2);
-              collisionToastCooldownSec = 0.8;
-            }
-            break;
-          }
-        }
-      }
-
-      // Collisions (player with planets / star) + low-altitude heating.
-      // This prevents flying through bodies and adds a bit of "danger close to gravity wells".
-      if (!docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle && currentSystem) {
-        // Star is at origin in system space.
-        {
-          const double rStarKm = std::max(1.0, currentSystem->star.radiusSol * kSOLAR_RADIUS_KM);
-          const double d = ship.positionKm().length();
-          if (d < rStarKm) {
-            const double relSpeed = ship.velocityKmS().length();
-            applyDamage(std::max(300.0, relSpeed * 80.0), playerShield, playerHull);
-
-            const math::Vec3d n = (d > 1e-6) ? (ship.positionKm() / d) : math::Vec3d{0, 1, 0};
-            ship.setPositionKm(n * (rStarKm + 5000.0));
-            ship.setVelocityKmS({0,0,0});
-
-            if (collisionToastCooldownSec <= 0.0) {
-              toast(toasts, "Star exclusion zone!", 1.6);
-              collisionToastCooldownSec = 1.2;
-            }
-          }
-        }
-
-        // Planets
-        for (const auto& p : currentSystem->planets) {
-          const math::Vec3d pPos = planetPosKm(p, timeDays);
-          const math::Vec3d pVel = planetVelKmS(p, timeDays);
-
-          const double rKm = std::max(1.0, p.radiusEarth * kEARTH_RADIUS_KM);
-          const math::Vec3d rel = ship.positionKm() - pPos;
-          const double dist = rel.length();
-          const double alt = dist - rKm;
-
-          // Very simple "atmosphere" heat when skimming very low.
-          // (Not physically accurate, but it gives pilots a reason to respect altitude.)
-          const double atmKm = std::max(120.0, rKm * 0.015);
-          if (alt > 0.0 && alt < atmKm) {
-            const double t = std::clamp(1.0 - alt / atmKm, 0.0, 1.0);
-            heat = std::min(120.0, heat + (8.0 + 28.0 * t) * dtReal);
-          }
-
-          // Impact / crash
-          if (dist < rKm) {
-            const double relSpeed = (ship.velocityKmS() - pVel).length();
-            applyDamage(std::max(120.0, relSpeed * 55.0), playerShield, playerHull);
-
-            const math::Vec3d n = (dist > 1e-6) ? (rel / dist) : math::Vec3d{0, 1, 0};
-            ship.setPositionKm(pPos + n * (rKm + 2000.0));
-            ship.setVelocityKmS(pVel);
-
-            if (collisionToastCooldownSec <= 0.0) {
-              toast(toasts, "IMPACT!", 1.6);
-              collisionToastCooldownSec = 1.2;
-            }
+            toast(toasts, "Collision!", 1.2);
             break;
           }
         }
@@ -3326,9 +3739,27 @@ for (const auto& c : contacts) {
                 cargo[i] = 0.0; // confiscated
               }
 
-              if (illegalValueCr <= 0.0) {
-                toast(toasts, "Cargo scan complete: clean.", 2.0);
-              } else {
+	              if (illegalValueCr <= 0.0) {
+	                const double outstandingBounty = getBounty(jurisdiction);
+	                if (outstandingBounty > 1e-6) {
+	                  policeDemand.active = true;
+	                  policeDemand.factionId = jurisdiction;
+	                  policeDemand.amountCr = outstandingBounty;
+	                  policeDemand.untilDays = timeDays + (18.0 / 86400.0);
+	                  policeDemand.sourceName = cargoScanSourceName;
+
+	                  // Heightened police attention for a short window.
+	                  policeAlertUntilDays = std::max(policeAlertUntilDays, timeDays + (90.0 / 86400.0));
+	                  nextPoliceSpawnDays = std::min(nextPoliceSpawnDays, timeDays + (5.0 / 86400.0));
+
+	                  toast(toasts,
+	                        "Warrant check: WANTED (" + std::to_string((int)std::round(outstandingBounty))
+	                          + " cr). Press I to submit/pay.",
+	                        4.0);
+	                } else {
+	                  toast(toasts, "Cargo scan complete: clean.", 2.0);
+	                }
+	              } else {
                 const double fineCr = 200.0 + illegalValueCr * 0.65;
                 const double paidCr = std::min(credits, fineCr);
                 credits -= paidCr;
@@ -3350,11 +3781,20 @@ for (const auto& c : contacts) {
                 // A bit of "heat" (affects encounter rates).
                 heat = std::min(100.0, heat + std::min(20.0, illegalValueCr / 2000.0));
 
-                std::string msg = "Contraband detected! Confiscated: "
+	                std::string msg = "Contraband detected! Confiscated: "
                                   + (detail.empty() ? std::string("illegal cargo") : detail)
                                   + ". Fine: " + std::to_string((int)std::round(fineCr)) + " cr"
                                   + (unpaidCr > 1e-6 ? " (unpaid -> bounty)" : "")
                                   + ". Rep " + std::to_string((int)std::round(repPenalty));
+	                if (unpaidCr > 1e-6) {
+	                  // Give the player a short "submit or fight" window.
+	                  policeDemand.active = true;
+	                  policeDemand.factionId = jurisdiction;
+	                  policeDemand.untilDays = timeDays + (18.0 / 86400.0);
+	                  policeDemand.amountCr = getBounty(jurisdiction);
+	                  policeDemand.sourceName = cargoScanSourceName;
+	                  msg += ". Press I to submit/pay.";
+	                }
                 toast(toasts, msg, 4.0);
               }
 
@@ -3538,24 +3978,83 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       }
     }
 
-    // --- STAR SCAN ---
-    if (!valid && scanLockedTarget.kind == TargetKind::Star) {
-      valid = true;
-      scanProgressSec += dtReal;
+	    // --- STAR SCAN ---
+	    if (!valid && scanLockedTarget.kind == TargetKind::Star) {
+	      valid = true;
+	      scanProgressSec += dtReal;
 
-      if (scanProgressSec >= scanDurationSec) {
-        const core::u64 key = scanKeyStar(currentSystem->stub.id);
-        if (scannedKeys.find(key) == scannedKeys.end()) {
-          scannedKeys.insert(key);
+	      if (scanProgressSec >= scanDurationSec) {
+	        const core::u64 key = scanKeyStar(currentSystem->stub.id);
+	        if (scannedKeys.find(key) == scannedKeys.end()) {
+	          scannedKeys.insert(key);
 
-          const double value = 220.0 + (double)static_cast<int>(currentSystem->star.cls) * 80.0;
-          explorationDataCr += value;
-          completeScan("Star scan logged (+data " + std::to_string((int)value) + " cr).", 2.2);
-        } else {
-          completeScan("Star already scanned.", 1.8);
-        }
-      }
-    }
+	          const double value = 220.0 + (double)static_cast<int>(currentSystem->star.cls) * 80.0;
+	          explorationDataCr += value;
+	          completeScan("Star scan logged (+data " + std::to_string((int)value) + " cr).", 2.2);
+	        } else {
+	          completeScan("Star already scanned.", 1.8);
+	        }
+	      }
+	    }
+
+	    // --- SIGNAL SCAN (distress / derelicts / resource sites) ---
+	    if (!valid && scanLockedTarget.kind == TargetKind::Signal && scanLockedTarget.index < signals.size()) {
+	      const auto& s = signals[scanLockedTarget.index];
+	      if (s.id == scanLockedId) {
+	        const double dist = (s.posKm - ship.positionKm()).length();
+	        if (dist <= scanRangeKm) {
+	          valid = true;
+	          scanProgressSec += dtReal;
+
+	          if (scanProgressSec >= scanDurationSec) {
+	            const core::u64 key = scanKeySignal(s.id);
+	            if (scannedKeys.find(key) == scannedKeys.end()) {
+	              scannedKeys.insert(key);
+
+	              double value = 140.0;
+	              if (s.type == SignalType::Distress) value = 180.0;
+	              if (s.type == SignalType::Derelict) value = 320.0;
+	              explorationDataCr += value;
+
+	              // Derelicts sometimes still hold an intact data core you can scoop.
+	              if (s.type == SignalType::Derelict) {
+	                spawnCargoPod(econ::CommodityId::Electronics, 1.0, s.posKm, {0,0,0}, 0.25);
+	              }
+
+	              completeScan(std::string("Signal scan logged (+data ") + std::to_string((int)value) + " cr).", 2.5);
+	            } else {
+	              completeScan("Signal already scanned.", 1.8);
+	            }
+	          }
+	        }
+	      }
+	    }
+
+	    // --- ASTEROID PROSPECT ---
+	    if (!valid && scanLockedTarget.kind == TargetKind::Asteroid && scanLockedTarget.index < asteroids.size()) {
+	      const auto& a = asteroids[scanLockedTarget.index];
+	      if (a.id == scanLockedId) {
+	        const double dist = (a.posKm - ship.positionKm()).length();
+	        if (dist <= scanRangeKm) {
+	          valid = true;
+	          scanProgressSec += dtReal;
+
+	          if (scanProgressSec >= scanDurationSec) {
+	            const core::u64 key = scanKeyAsteroid(a.id);
+	            if (scannedKeys.find(key) == scannedKeys.end()) {
+	              scannedKeys.insert(key);
+
+	              const double value = 45.0;
+	              explorationDataCr += value;
+	              const std::string cname = econ::commodityDef(a.yield).name;
+	              completeScan(std::string("Asteroid prospected: ") + cname + " (+data " + std::to_string((int)value) + " cr).", 2.5);
+	            } else {
+	              completeScan("Asteroid already prospected.", 1.8);
+	            }
+	          }
+	        }
+	      }
+	    }
 
     // If we successfully scanned something, check "system completion" bonus once.
     if (!scanning) {
@@ -3600,7 +4099,154 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
   scanProgressSec = 0.0;
 }
 
-      // --- Heat model (real-time) ---
+	      // --- Salvage / signals / mining objects ---
+	      {
+	        // Police "submit or fight" window expiry
+	        if (policeDemand.active && timeDays > policeDemand.untilDays) {
+	          toast(toasts, policeDemand.sourceName + ": no compliance detected. Lethal force authorized!", 3.0);
+	          policeDemand.active = false;
+	        }
+
+	        // Drift + despawn floating cargo pods
+	        for (auto& pod : floatingCargo) {
+	          pod.posKm += pod.velKmS * dtSim;
+	          // light damping to keep the field readable
+	          pod.velKmS *= std::pow(0.985, dtSim);
+	        }
+	        for (std::size_t i = 0; i < floatingCargo.size(); /*manual*/) {
+	          const bool expired = (floatingCargo[i].expireDay > 0.0 && timeDays > floatingCargo[i].expireDay);
+	          const bool empty = (floatingCargo[i].units <= 1e-4);
+	          if (expired || empty) {
+	            if (target.kind == TargetKind::Cargo) {
+	              if (target.index == i) target = {};
+	              else if (target.index > i) target.index--;
+	            }
+	            floatingCargo.erase(floatingCargo.begin() + (std::ptrdiff_t)i);
+	            continue;
+	          }
+	          ++i;
+	        }
+
+	        // Despawn expired signal sources (and keep target index consistent)
+	        for (std::size_t i = 0; i < signals.size(); /*manual*/) {
+	          const bool expired = (signals[i].expireDay > 0.0 && timeDays > signals[i].expireDay);
+	          if (expired) {
+	            if (target.kind == TargetKind::Signal) {
+	              if (target.index == i) target = {};
+	              else if (target.index > i) target.index--;
+	            }
+	            signals.erase(signals.begin() + (std::ptrdiff_t)i);
+	            continue;
+	          }
+	          ++i;
+	        }
+
+	        // Resolve signal sites when you arrive in normal space
+	        if (!docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
+	          const double kResolveRangeKm = 90000.0;
+	          for (auto& s : signals) {
+	            if (s.resolved) continue;
+	            const double distKm = (s.posKm - ship.positionKm()).length();
+	            if (distKm > kResolveRangeKm) continue;
+	
+	            s.resolved = true;
+	
+	            if (s.type == SignalType::Resource) {
+	              if (!s.fieldSpawned) {
+	                s.fieldSpawned = true;
+	                const int n = 24 + rng.range(0, 16);
+	                for (int i = 0; i < n; ++i) {
+	                  AsteroidNode a;
+	                  a.id = allocWorldId();
+	                  a.posKm = s.posKm + randUnit() * rng.range(20000.0, 120000.0);
+	                  a.radiusKm = rng.range(1400.0, 4200.0);
+	                  a.yield = (rng.nextUnit() < 0.18) ? econ::CommodityId::Metals : econ::CommodityId::Ore;
+	                  a.remainingUnits = rng.range(70.0, 220.0) * (a.yield == econ::CommodityId::Metals ? 0.65 : 1.0);
+	                  asteroids.push_back(a);
+	                }
+	              }
+	              toast(toasts, "Arrived at Resource Site: asteroid fragments detected.", 3.0);
+	            } else if (s.type == SignalType::Derelict) {
+	              toast(toasts, "Derelict located. Salvage pods drifting nearby.", 3.0);
+	              // Spawn salvage pods once.
+	              const int pods = 2 + rng.range(0, 3);
+	              for (int i = 0; i < pods; ++i) {
+	                const econ::CommodityId table[] = {econ::CommodityId::Machinery, econ::CommodityId::Electronics, econ::CommodityId::Metals, econ::CommodityId::Luxury};
+	                const auto cid = table[rng.range(0, (int)std::size(table) - 1)];
+	                const double units = rng.range(2.0, 10.0);
+	                spawnCargoPod(cid, units, s.posKm + randUnit() * rng.range(1500.0, 9000.0), {0,0,0}, 0.35);
+	              }
+	            } else if (s.type == SignalType::Distress) {
+	              toast(toasts, "Distress beacon acquired. Approach with caution.", 3.0);
+	              // Some supplies may be drifting...
+	              spawnCargoPod(econ::CommodityId::Food, rng.range(3.0, 12.0), s.posKm + randUnit() * rng.range(1500.0, 7000.0), {0,0,0}, 0.35);
+	              // ...and sometimes it's an ambush.
+	              if (rng.nextUnit() < 0.55) {
+	                const int pirates = 1 + rng.range(0, 2);
+	                for (int i = 0; i < pirates; ++i) {
+	                  Contact p;
+	                  p.id = allocWorldId();
+	                  p.role = ContactRole::Pirate;
+	                  p.name = "Pirate " + std::to_string((int)contacts.size() + 1);
+	                  p.factionId = 0;
+	                  p.hostileToPlayer = true;
+	                  p.ship = sim::Ship{};
+	                  p.ship.setPositionKm(s.posKm + randUnit() * rng.range(80000.0, 140000.0));
+	                  p.ship.setVelocityKmS({0,0,0});
+	                  p.ship.setOrientation(ship.orientation());
+	                  p.ship.setAngularVelocityRadS({0,0,0});
+	                  p.ship.setMaxLinearAccelKmS2(0.06);
+	                  p.ship.setMaxAngularAccelRadS2(0.9);
+	                  p.hullMax = npcHullMax;
+	                  p.hull = npcHullMax;
+	                  p.shieldMax = npcShieldMax;
+	                  p.shield = npcShieldMax;
+	                  p.shieldRegenPerSec = npcShieldRegenPerSec;
+	                  contacts.push_back(p);
+	                }
+	                toast(toasts, "Ambush! Pirate signatures inbound.", 3.0);
+	              }
+	            }
+	          }
+	        }
+
+	        // Cargo scooping (ties combat/mining to trade)
+	        if (!docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle && cargoScoopDeployed) {
+	          const double kScoopRangeKm = 3500.0;
+	          const double kMaxRelSpeedKmS = 18.0;
+	          const double shipMassKg = cargoMassKg(cargo) + ship.massKg();
+	          (void)shipMassKg; // reserved for future handling
+	
+	          const math::Vec3d shipPos = ship.positionKm();
+	          const math::Vec3d shipVel = ship.velocityKmS();
+	
+	          for (std::size_t i = 0; i < floatingCargo.size(); ++i) {
+	            auto& pod = floatingCargo[i];
+	            const double distKm = (pod.posKm - shipPos).length();
+	            if (distKm > kScoopRangeKm) continue;
+	            const double relSpd = (pod.velKmS - shipVel).length();
+	            if (relSpd > kMaxRelSpeedKmS) continue;
+	
+	            const auto def = econ::commodityDef(pod.commodity);
+	            const double freeKg = cargoCapacityKg - cargoMassKg(cargo);
+	            const double maxUnits = freeKg / std::max(0.001, def.massKg);
+	            const double takeUnits = std::min(pod.units, std::floor(maxUnits + 1e-6));
+	
+	            if (takeUnits >= 1e-4) {
+	              cargo[(int)pod.commodity] += takeUnits;
+	              pod.units -= takeUnits;
+	              toast(toasts, "Scooped " + def.name + " x" + std::to_string((int)takeUnits), 2.0);
+	            } else {
+	              if (timeDays > cargoFullToastCooldownUntilDays) {
+	                cargoFullToastCooldownUntilDays = timeDays + (4.0 / 86400.0);
+	                toast(toasts, "Cargo hold full.", 2.0);
+	              }
+	            }
+	          }
+	        }
+	      }
+
+	      // --- Heat model (real-time) ---
       {
         double heatIn = 0.0;
         if (!docked) {
@@ -3779,9 +4425,6 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // Toast TTL
     for (auto& t : toasts) t.ttl -= dtReal;
     toasts.erase(std::remove_if(toasts.begin(), toasts.end(), [](const ToastMsg& t){ return t.ttl <= 0.0; }), toasts.end());
-
-    // Cooldowns
-    collisionToastCooldownSec = std::max(0.0, collisionToastCooldownSec - dtReal);
 
     // ---- Camera follow (third-person) ----
     render::Camera cam;
@@ -4004,6 +4647,38 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                                r,g,b));
     }
 
+	    // Floating salvage / cargo pods
+	    for (const auto& pod : floatingCargo) {
+	      if (pod.units <= 0.0) continue;
+	      const float r = 1.00f, g = 0.85f, b = 0.25f;
+	      cubes.push_back(makeInst(toRenderU(pod.posKm),
+	                               {0.12, 0.12, 0.12},
+	                               math::Quatd::identity(),
+	                               r,g,b));
+	    }
+
+	    // Asteroid mining nodes
+	    for (const auto& a : asteroids) {
+	      const float r = 0.55f, g = 0.55f, b = 0.58f;
+	      const double s = std::clamp(a.radiusKm / 3500.0, 0.35, 1.25);
+	      cubes.push_back(makeInst(toRenderU(a.posKm),
+	                               {0.55 * s, 0.55 * s, 0.55 * s},
+	                               math::Quatd::identity(),
+	                               r,g,b));
+	    }
+
+	    // Signal sources (distress / derelicts / resource sites)
+	    for (const auto& s : signals) {
+	      float r = 0.85f, g = 0.85f, b = 0.85f;
+	      if (s.type == SignalType::Distress) { r = 1.0f; g = 0.6f; b = 0.2f; }
+	      if (s.type == SignalType::Derelict) { r = 0.75f; g = 0.75f; b = 1.0f; }
+	      if (s.type == SignalType::Resource) { r = 0.55f; g = 0.95f; b = 0.55f; }
+	      cubes.push_back(makeInst(toRenderU(s.posKm),
+	                               {0.25, 0.25, 0.25},
+	                               math::Quatd::identity(),
+	                               r,g,b));
+	    }
+
     // ---- Render ---
     glViewport(0, 0, w, h);
     glClearColor(0.01f, 0.01f, 0.02f, 1.0f);
@@ -4056,6 +4731,20 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           tgtKm = c.ship.positionKm();
           tgtLabel = c.name + std::string(" [") + contactRoleName(c.role) + "]";
         }
+	      } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
+	        const auto& s = signals[target.index];
+	        tgtKm = s.posKm;
+	        tgtLabel = std::string(signalTypeName(s.type)) + " Signal";
+	      } else if (target.kind == TargetKind::Cargo && target.index < floatingCargo.size()) {
+	        const auto& pod = floatingCargo[target.index];
+	        tgtKm = pod.posKm;
+	        const auto& def = econ::commodityDef(pod.commodity);
+	        tgtLabel = def.name + std::string(" Pod") + (pod.units >= 1.0 ? (" x" + std::to_string((int)std::round(pod.units))) : "");
+	      } else if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
+	        const auto& a = asteroids[target.index];
+	        tgtKm = a.posKm;
+	        const auto& def = econ::commodityDef(a.yield);
+	        tgtLabel = std::string("Asteroid [") + def.name + "]";
       }
 
       if (tgtKm) {
@@ -4068,90 +4757,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         }
       }
 
-      // Kinetic lead indicator (projectile weapons): helps make early combat feel fair.
-      if (!docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle &&
-          target.kind == TargetKind::Contact && target.index < contacts.size()) {
-        const auto& c = contacts[target.index];
-        if (c.alive) {
-          const WeaponDef& lw = weaponDef(lastFiredWeapon);
-          if (!lw.beam && lw.projSpeedKmS > 1e-6) {
-            const math::Vec3d relPos = c.ship.positionKm() - ship.positionKm();
-            const math::Vec3d relVel = c.ship.velocityKmS() - ship.velocityKmS();
-            if (auto tHit = solveInterceptTimeSec(relPos, relVel, lw.projSpeedKmS)) {
-              const double t = *tHit;
-              // Ignore absurd solutions (keeps the indicator stable).
-              if (t > 0.0 && t < 180.0) {
-                const math::Vec3d leadKm = c.ship.positionKm() + c.ship.velocityKmS() * t;
-                ImVec2 pxLead{};
-                if (projectToScreen(toRenderU(leadKm), view, proj, w, h, pxLead)) {
-                  const ImU32 col = IM_COL32(120, 255, 220, 200);
-                  draw->AddCircle({pxLead.x, pxLead.y}, 11.0f, col, 1.6f);
-                  draw->AddLine({pxLead.x - 7, pxLead.y}, {pxLead.x + 7, pxLead.y}, col, 1.1f);
-                  draw->AddLine({pxLead.x, pxLead.y - 7}, {pxLead.x, pxLead.y + 7}, col, 1.1f);
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // Interdiction HUD: escape vector marker + progress bar (supercruise only).
-      if (supercruiseState == SupercruiseState::Active && interdictionState != InterdictionState::None) {
-        const math::Vec3d escDir = interdictionEscapeDir.normalized();
-        const math::Vec3d escPosKm = ship.positionKm() + escDir * 200000.0;
-
-        ImVec2 pxEsc{};
-        if (projectToScreen(toRenderU(escPosKm), view, proj, w, h, pxEsc)) {
-          const ImU32 col = IM_COL32(255, 130, 90, 220);
-          draw->AddCircle({pxEsc.x, pxEsc.y}, 18.0f, col, 2.0f);
-          draw->AddText({pxEsc.x + 20.0f, pxEsc.y - 10.0f}, col, "ESC");
-        }
-
-        const float barW = 220.0f;
-        const float barH = 10.0f;
-        const float frac = (float)std::clamp(interdictionEscapeMeter, 0.0, 1.0);
-
-        const ImVec2 p0(center.x - barW * 0.5f, 18.0f);
-        const ImVec2 p1(center.x + barW * 0.5f, 18.0f + barH);
-
-        draw->AddRectFilled(p0, p1, IM_COL32(20, 20, 20, 160), 3.0f);
-        draw->AddRectFilled(p0, {p0.x + barW * frac, p1.y}, IM_COL32(255, 130, 90, 200), 3.0f);
-        draw->AddRect(p0, p1, IM_COL32(255, 200, 170, 220), 3.0f);
-
-        draw->AddText({p0.x, p1.y + 2.0f}, IM_COL32(255, 200, 170, 220), "INTERDICTION");
-      }
-
-      // Supercruise HUD (distance/ETA + safe-drop indicator).
-      if (supercruiseState != SupercruiseState::Idle) {
-        ImVec2 ds = io.DisplaySize;
-        float y0 = ds.y - 78.0f;
-
-        char buf[256];
-        const ImU32 col = (supercruiseState == SupercruiseState::Active && supercruiseSafeDropReady)
-                            ? IM_COL32(160, 255, 190, 220)
-                            : IM_COL32(200, 210, 240, 210);
-
-        if (supercruiseState == SupercruiseState::Charging) {
-          std::snprintf(buf, sizeof(buf), "Supercruise: CHARGING (%.1fs)", supercruiseChargeRemainingSec);
-        } else if (supercruiseState == SupercruiseState::Cooldown) {
-          std::snprintf(buf, sizeof(buf), "Supercruise: COOLDOWN (%.1fs)", supercruiseCooldownRemainingSec);
-        } else {
-          std::snprintf(buf, sizeof(buf), "Supercruise: %.0f km | ETA %.1fs | closing %.1f km/s | %s",
-                        supercruiseDistKm,
-                        supercruiseTtaSec,
-                        supercruiseClosingKmS,
-                        supercruiseSafeDropReady ? "SAFE DROP" : "DROP UNSAFE");
-        }
-
-        draw->AddText({18.0f, y0}, col, buf);
-        if (supercruiseState == SupercruiseState::Active) {
-          draw->AddText({18.0f, y0 + 18.0f}, col, "Press H to drop (assist auto-drops in SAFE window).");
-        }
-      }
-
       // Docking corridor HUD for targeted station
-      if (supercruiseState == SupercruiseState::Idle && fsdState == FsdState::Idle &&
-          currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+      if (currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
         const auto& st = currentSystem->stations[target.index];
 
         const math::Vec3d stPos = stationPosKm(st, timeDays);
@@ -4227,11 +4834,19 @@ if (showShip) {
     ImGui::Text("Local faction: (none)");
   }
 
-  ImGui::Separator();
-
   ImGui::Text("Credits: %.0f | Exploration data: %.0f cr", credits, explorationDataCr);
   ImGui::Text("Fuel: %.1f | Heat: %.0f", fuel, heat);
   ImGui::Text("Cargo: %.0f / %.0f kg", cargoMassKg(cargo), cargoCapacityKg);
+	  ImGui::Text("Cargo scoop (O): %s | Floating pods: %d", cargoScoopDeployed ? "DEPLOYED" : "RETRACTED",
+	              (int)floatingCargo.size());
+
+	  {
+	    double totalVouchers = 0.0;
+	    for (const auto& kv : bountyVoucherByFaction) totalVouchers += std::max(0.0, kv.second);
+	    if (totalVouchers > 0.0) {
+	      ImGui::Text("Bounty vouchers: %.0f cr (redeem at matching faction stations)", totalVouchers);
+	    }
+	  }
   ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax, playerHull, playerHullMax);
 
   {
@@ -4386,7 +5001,6 @@ if (showShip) {
   ImGui::BulletText("WASD / Space/Ctrl: translate | Arrows: pitch/yaw | Q/E: roll");
   ImGui::BulletText("Shift: boost | X: brake | LMB: %s | RMB: %s", weaponDef(weaponPrimary).name, weaponDef(weaponSecondary).name);
   ImGui::BulletText("H: supercruise (charge/engage). While active: H drops (~7s safe). During interdiction: H submits");
-  ImGui::BulletText("HUD: kinetic lead marker shows where to aim for moving targets (projectile weapons)");
   ImGui::BulletText("J engage FSD jump (uses plotted route if present)");
   ImGui::BulletText("P: autopilot to station (staging + corridor guidance)");
   ImGui::BulletText("T/B/N/U cycle targets, Y clear target");
@@ -4525,6 +5139,29 @@ if (showScanner) {
       scanRangeKm = std::max(25000.0, st.commsRangeKm * 0.9);
       scanLabel = "Station scan: " + st.name;
       ok = true;
+	    } else if (kind == TargetKind::Contact && idx < contacts.size()) {
+	      const auto& c = contacts[idx];
+	      if (c.alive) {
+	        scanLockedId = c.id;
+	        scanDurationSec = 3.5;
+	        scanRangeKm = 140000.0;
+	        scanLabel = "Ship scan: " + c.name;
+	        ok = true;
+	      }
+	    } else if (kind == TargetKind::Signal && idx < signals.size()) {
+	      const auto& s = signals[idx];
+	      scanLockedId = s.id;
+	      scanDurationSec = 4.0;
+	      scanRangeKm = 200000.0;
+	      scanLabel = std::string("Signal scan: ") + signalTypeName(s.type);
+	      ok = true;
+	    } else if (kind == TargetKind::Asteroid && idx < asteroids.size()) {
+	      const auto& a = asteroids[idx];
+	      scanLockedId = a.id;
+	      scanDurationSec = 4.5;
+	      scanRangeKm = 150000.0;
+	      scanLabel = std::string("Asteroid prospect: ") + econ::commodityDef(a.yield).name;
+	      ok = true;
     }
 
     if (ok) {
@@ -4628,8 +5265,82 @@ if (showScanner) {
     ImGui::PopID();
   }
 
-  ImGui::Separator();
-  ImGui::Text("Exploration data bank: %.0f cr", explorationDataCr);
+	  // Signals / salvage / mining
+	  ImGui::Separator();
+	  ImGui::Text("Signal Sources");
+	  if (signals.empty()) {
+	    ImGui::TextDisabled("(none detected)");
+	  } else {
+	    for (std::size_t i = 0; i < signals.size(); ++i) {
+	      const auto& s = signals[i];
+	      const double distKm = (s.posKm - ship.positionKm()).length();
+	      const double minsLeft = (s.expireDay > 0.0) ? (s.expireDay - timeDays) * 1440.0 : 0.0;
+	      ImGui::PushID((int)i + 9000);
+	      ImGui::Text("%s%s | %.0f km%s", signalTypeName(s.type), s.resolved ? " (resolved)" : "", distKm,
+	                  (s.expireDay > 0.0) ? (std::string(" | ") + std::to_string((int)std::round(std::max(0.0, minsLeft)))
+	                                        + " min").c_str()
+	                                     : "");
+	      ImGui::SameLine();
+	      if (ImGui::SmallButton("Target##sig")) {
+	        target.kind = TargetKind::Signal;
+	        target.index = i;
+	      }
+	      ImGui::SameLine();
+	      if (ImGui::SmallButton("Scan##sig")) {
+	        uiStartScan(TargetKind::Signal, i);
+	      }
+	      ImGui::PopID();
+	    }
+	  }
+
+	  ImGui::Separator();
+	  ImGui::Text("Asteroids");
+	  if (asteroids.empty()) {
+	    ImGui::TextDisabled("(no nearby belts)");
+	  } else {
+	    for (std::size_t i = 0; i < asteroids.size(); ++i) {
+	      const auto& a = asteroids[i];
+	      if (a.remainingUnits <= 1e-3) continue;
+	      const double distKm = (a.posKm - ship.positionKm()).length();
+	      ImGui::PushID((int)i + 12000);
+	      ImGui::Text("%s | %.0f u | %.0f km", econ::commodityDef(a.yield).name.c_str(),
+	                  std::round(std::max(0.0, a.remainingUnits)), distKm);
+	      ImGui::SameLine();
+	      if (ImGui::SmallButton("Target##ast")) {
+	        target.kind = TargetKind::Asteroid;
+	        target.index = i;
+	      }
+	      ImGui::SameLine();
+	      if (ImGui::SmallButton("Prospect##ast")) {
+	        uiStartScan(TargetKind::Asteroid, i);
+	      }
+	      ImGui::PopID();
+	    }
+	  }
+
+	  ImGui::Separator();
+	  ImGui::Text("Floating Cargo");
+	  if (floatingCargo.empty()) {
+	    ImGui::TextDisabled("(none)");
+	  } else {
+	    for (std::size_t i = 0; i < floatingCargo.size(); ++i) {
+	      const auto& pod = floatingCargo[i];
+	      const double distKm = (pod.posKm - ship.positionKm()).length();
+	      const double minsLeft = (pod.expireDay > 0.0) ? (pod.expireDay - timeDays) * 1440.0 : 0.0;
+	      ImGui::PushID((int)i + 15000);
+	      ImGui::Text("%s x%.0f | %.0f km | %d min", econ::commodityDef(pod.commodity).name.c_str(),
+	                  std::round(std::max(0.0, pod.units)), distKm, (int)std::round(std::max(0.0, minsLeft)));
+	      ImGui::SameLine();
+	      if (ImGui::SmallButton("Target##pod")) {
+	        target.kind = TargetKind::Cargo;
+	        target.index = i;
+	      }
+	      ImGui::PopID();
+	    }
+	  }
+
+	  ImGui::Separator();
+	  ImGui::Text("Exploration data bank: %.0f cr", explorationDataCr);
   if (docked && selectedStationIndex >= 0 && selectedStationIndex < (int)currentSystem->stations.size()) {
     if (explorationDataCr > 0.0) {
       if (ImGui::Button("Sell exploration data here")) {
@@ -4980,6 +5691,30 @@ if (canTrade) {
   } else {
     ImGui::TextDisabled("No bounty.");
   }
+
+	  const double vouchers = getVoucher(station.factionId);
+	  ImGui::Text("Bounty vouchers (this faction): %.0f cr", vouchers);
+	  if (vouchers > 0.0) {
+	    if (ImGui::Button("Redeem vouchers")) {
+	      credits += vouchers;
+	      clearVoucher(station.factionId);
+	      toast(toasts, "Redeemed bounty vouchers +" + std::to_string((int)vouchers) + " cr.", 2.5);
+	      addRep(station.factionId, +0.6);
+	    }
+	  } else {
+	    ImGui::TextDisabled("No vouchers.");
+	  }
+	  // Small hint if you have vouchers elsewhere
+	  {
+	    double other = 0.0;
+	    for (const auto& kv : bountyVoucherByFaction) {
+	      if (kv.first == station.factionId) continue;
+	      other += kv.second;
+	    }
+	    if (other > 0.0) {
+	      ImGui::TextDisabled("Other jurisdictions: %.0f cr", other);
+	    }
+	  }
 }
 
         static int selectedCommodity = 0;

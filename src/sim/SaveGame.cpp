@@ -123,6 +123,12 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
     f << "bounty " << b.factionId << " " << b.bountyCr << "\n";
   }
 
+  // Bounty vouchers (earned from destroying criminals; redeemed later)
+  f << "bounty_vouchers " << s.bountyVouchers.size() << "\n";
+  for (const auto& v : s.bountyVouchers) {
+    f << "voucher " << v.factionId << " " << v.bountyCr << "\n";
+  }
+
   f << "station_overrides " << s.stationOverrides.size() << "\n";
   for (const auto& ov : s.stationOverrides) {
     f << "station " << ov.stationId << "\n";
@@ -394,6 +400,25 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         FactionBounty b{};
         if (!(f >> b.factionId >> b.bountyCr)) break;
         out.bounties.push_back(std::move(b));
+      }
+    } else if (key == "bounty_vouchers") {
+      std::size_t n = 0;
+      f >> n;
+      out.bountyVouchers.clear();
+      out.bountyVouchers.reserve(n);
+
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "voucher") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+        FactionBounty v{};
+        if (!(f >> v.factionId >> v.bountyCr)) break;
+        out.bountyVouchers.push_back(std::move(v));
       }
     } else if (key == "station_overrides") {
       std::size_t n = 0;

@@ -84,7 +84,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{7};
+  int version{8};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -139,6 +139,8 @@ struct SaveGame {
 
   // Law / bounties
   std::vector<FactionBounty> bounties{};
+  // Bounty vouchers earned for destroying criminals (redeem at stations).
+  std::vector<FactionBounty> bountyVouchers{};
 
   std::vector<StationEconomyOverride> stationOverrides{};
 };
