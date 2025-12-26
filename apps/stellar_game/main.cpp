@@ -1109,7 +1109,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
     for (int attempt = 0; attempt < 6; ++attempt) {
       auto nearby = universe.queryNearby(currentSystem->stub.posLy, radius);
-      auto route = plotRouteAStarHops(nearby, currentSystem->stub.id, destSystemId, jrMaxLy, 4.0);
+      auto route = plotRouteAStarHops(nearby, currentSystem->stub.id, destSystemId, jrMaxLy);
       if (!route.empty()) {
         navRoute = std::move(route);
         navRouteHop = 0;
@@ -3745,7 +3745,7 @@ if (showGuide) {
       }
     }
     if (dockSt) {
-      if (dockSt->type == sim::StationType::Shipyard) {
+      if (dockSt->type == econ::StationType::Shipyard) {
         ImGui::TextDisabled("Shipyard available here: upgrade hull/modules/weapons under Market > Shipyard");
       } else {
         ImGui::TextDisabled("No shipyard at this station. Try another station for upgrades.");
@@ -4125,13 +4125,15 @@ if (showScanner) {
 
             // Core modules (thrusters / shield gen / distributor)
             {
-              auto installMk = [&](const char* label, int& mkVar, const std::array<MkDef, 4>& defs) {
+              auto installMk = [&](const char* label, int& mkVar, const MkDef (&defs)[4]) {
                 static int choice[3] = {1, 1, 1};
                 static int sync[3] = {-1, -1, -1};
                 int slot = 0;
                 if (std::string(label).find("Thrusters") != std::string::npos) slot = 0;
                 else if (std::string(label).find("Shield") != std::string::npos) slot = 1;
                 else slot = 2;
+
+                mkVar = std::clamp(mkVar, 1, 3);
 
                 if (sync[slot] != mkVar) {
                   choice[slot] = mkVar;
@@ -4175,9 +4177,9 @@ if (showScanner) {
                 ImGui::TextDisabled("(%.0f cr)", cost);
               };
 
-              installMk("Thrusters", thrusterMk, kThrusterDefs);
-              installMk("Shield Gen", shieldMk, kShieldDefs);
-              installMk("Distributor", distributorMk, kDistDefs);
+              installMk("Thrusters", thrusterMk, kThrusters);
+              installMk("Shield Gen", shieldMk, kShields);
+              installMk("Distributor", distributorMk, kDistributors);
             }
 
             // Weapons / hardpoints
@@ -4401,18 +4403,18 @@ if (canTrade) {
             float radiusLy = (float)tradeSearchRadiusLy;
             if (ImGui::SliderFloat("Search radius (ly)", &radiusLy, 80.0f, 500.0f, "%.0f")) {
               tradeSearchRadiusLy = (double)radiusLy;
-              tradeDayStamp = -1; // force refresh
+              tradeIdeasDayStamp = -1; // force refresh
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Refresh")) {
-              tradeDayStamp = -1;
+              tradeIdeasDayStamp = -1;
             }
 
             const int dayStamp = (int)std::floor(timeDays);
-            if (tradeFromStationId != fromStationId || tradeDayStamp != dayStamp) {
+            if (tradeFromStationId != fromStationId || tradeIdeasDayStamp != dayStamp) {
               tradeIdeas.clear();
               tradeFromStationId = fromStationId;
-              tradeDayStamp = dayStamp;
+              tradeIdeasDayStamp = dayStamp;
 
               auto& fromEcon = universe.stationEconomy(*fromSt, timeDays);
 
@@ -4779,8 +4781,6 @@ if (canTrade) {
                 if (offerIdx >= missionOffers.size()) return false;
 
                 sim::Mission m = missionOffers[offerIdx];
-                m.acceptedDay = timeDays;
-
                 // If it's a delivery, ensure we can fit the cargo and (if required) auto-buy it.
                 if (m.type == sim::MissionType::Delivery && m.units > 0.0) {
                   const double massKg = econ::commodityDef(m.commodity).massKg;
@@ -4807,7 +4807,7 @@ if (canTrade) {
 
                     const auto tr = econ::buy(stEcon, st.economyModel, m.commodity, (double)m.units, credits, 0.10, feeEff);
                     if (!tr.ok) {
-                      toast(toasts, tr.reason.c_str(), 3.0);
+                      toast(toasts, tr.reason ? tr.reason : "Trade failed.", 3.0);
                       return false;
                     }
                     cargo[(int)m.commodity] += tr.unitsDelta;
@@ -4819,7 +4819,7 @@ if (canTrade) {
                 toast(toasts, "Mission accepted.", 2.0);
 
                 if (autoPlot) {
-                  const bool hasVia = (m.viaSystem != 0 && m.viaStation != 0 && !m.viaDone);
+                  const bool hasVia = (m.viaSystem != 0 && m.viaStation != 0 && m.leg == 0);
                   const sim::SystemId destSys = hasVia ? m.viaSystem : m.toSystem;
                   const sim::StationId destSt = hasVia ? m.viaStation : m.toStation;
                   plotRouteToSystem(destSys);
@@ -4910,8 +4910,8 @@ if (canTrade) {
                 if (acceptDisabled) ImGui::EndDisabled();
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Plot")) {
-                  const sim::SystemId legSys = (offer.viaSystem != 0 && !offer.viaDone) ? offer.viaSystem : offer.toSystem;
-                  const sim::StationId legSt = (offer.viaSystem != 0 && !offer.viaDone) ? offer.viaStation : offer.toStation;
+                  const sim::SystemId legSys = (offer.viaSystem != 0 && offer.viaStation != 0 && offer.leg == 0) ? offer.viaSystem : offer.toSystem;
+                  const sim::StationId legSt = (offer.viaSystem != 0 && offer.viaStation != 0 && offer.leg == 0) ? offer.viaStation : offer.toStation;
                   if (plotRouteToSystem(legSys)) {
                     pendingArrivalTargetStationId = legSt;
                     if (legSys == currentSystem->stub.id) tryTargetStationById(legSt);
