@@ -1,3 +1,10 @@
+// SDL on Windows may redefine main() to SDL_main() unless SDL_MAIN_HANDLED is set.
+// This project links SDL2 but not SDL2main, so we keep a normal C-runtime main()
+// entry point and call SDL_SetMainReady() manually.
+#if defined(_WIN32)
+#define SDL_MAIN_HANDLED
+#endif
+
 #include "stellar/core/Log.h"
 #include "stellar/core/Random.h"
 #include "stellar/core/Hash.h"
@@ -16,6 +23,12 @@
 
 #include <SDL.h>
 #include <SDL_opengl.h>
+
+// Some SDL2 distributions (or build flags) may still define `main` as a macro.
+// Ensure we declare the real C runtime entry point symbol.
+#ifdef main
+#undef main
+#endif
 
 #include <imgui.h>
 #include <backends/imgui_impl_opengl3.h>
@@ -543,6 +556,12 @@ int main(int argc, char** argv) {
   (void)argc; (void)argv;
 
   core::setLogLevel(core::LogLevel::Info);
+
+#if defined(_WIN32)
+  // When SDL_MAIN_HANDLED is used, SDL expects the app to call SDL_SetMainReady()
+  // before SDL_Init().
+  SDL_SetMainReady();
+#endif
 
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0) {
     core::log(core::LogLevel::Error, std::string("SDL_Init failed: ") + SDL_GetError());
@@ -1837,18 +1856,13 @@ if (event.key.keysym.sym == SDLK_y) {
               projectiles.push_back(p);
 
               // Tiny recoil impulse
-	              ship.setVelocityKmS(ship.velocityKmS() - fwd * (wType == WeaponType::Railgun ? 0.003 : 0.002));
-	            }
-	          }
-	        }
-	      }
+              ship.setVelocityKmS(ship.velocityKmS() - fwd * (wType == WeaponType::Railgun ? 0.003 : 0.002));
+            }
+          }
+        }
+      }
 
-	    // NOTE: this brace ends the per-frame SDL event pump.
-	    // The remainder of the frame (continuous input, sim update, render) must run once per frame,
-	    // not once per SDL event.
-	    }
-
-	    // Input (6DOF)
+    // Input (6DOF)
     sim::ShipInput input{};
     const Uint8* keys = SDL_GetKeyboardState(nullptr);
 
@@ -4500,8 +4514,7 @@ if (canTrade) {
                   ImGui::TextDisabled("%.0f ly (~%d jumps)", t.distanceLy, (int)std::ceil(t.distanceLy / jr));
 
                   ImGui::TableNextColumn();
-	                  // CommodityDef::name is a const char* (not std::string).
-	                  ImGui::Text("%s", econ::commodityDef(t.commodity).name);
+                  ImGui::Text("%s", econ::commodityDef(t.commodity).name.c_str());
                   ImGui::TextDisabled("%.0f kg/u", econ::commodityDef(t.commodity).massKg);
 
                   ImGui::TableNextColumn();
