@@ -18,6 +18,10 @@ enum class CommodityId : core::u16 {
   Electronics,
   Luxury,
 
+  // Higher-value / specialty goods.
+  Weapons,
+  Stimulants,
+
   Count
 };
 

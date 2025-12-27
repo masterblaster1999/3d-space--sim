@@ -30,6 +30,13 @@ struct FactionBounty {
   double bountyCr{0.0};
 };
 
+// Persistent day-stamp for deterministic "background" traffic simulation.
+// Only systems the player has visited need to be tracked.
+struct SystemTrafficStamp {
+  SystemId systemId{0};
+  int dayStamp{-1};
+};
+
 // Lightweight "gameplay" mission representation.
 // Stored in the save file so early progression loops (cargo delivery/courier/bounties)
 // persist across runs.
@@ -39,6 +46,8 @@ enum class MissionType : core::u8 {
   BountyScan,
   BountyKill,
   MultiDelivery,
+  Passenger,
+  Smuggle,
 };
 
 struct Mission {
@@ -54,7 +63,7 @@ struct Mission {
   SystemId toSystem{0};
   StationId toStation{0};
 
-  // Delivery missions use a commodity + units.
+  // Delivery / smuggling missions use a commodity + units.
   econ::CommodityId commodity{econ::CommodityId::Food};
   double units{0.0};
 
@@ -84,7 +93,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{8};
+  int version{12};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -114,6 +123,10 @@ struct SaveGame {
   double shield{1.0}; // 0..1
   double heat{0.0}; // gameplay heat (0..~120)
   double cargoCapacityKg{420.0};
+
+  // Passenger capacity (seats) for cabin-style missions.
+  // Kept intentionally simple for the prototype loop.
+  int passengerSeats{2};
   double fsdReadyDay{0.0}; // timeDays when the next hyperspace jump is allowed
 
   // Loadout / progression (kept simple for now: small ints, interpreted by gameplay code).
@@ -124,6 +137,9 @@ struct SaveGame {
   core::u8 distributorMk{1};   // 1..3
   core::u8 weaponPrimary{0};   // enum in gameplay (0=beam, 1=pulse, 2=cannon, 3=rail)
   core::u8 weaponSecondary{2}; // default cannon
+
+  // Smuggling / stealth: reduces chance of cargo scans when carrying contraband.
+  core::u8 smuggleHoldMk{0}; // 0..3
 
   // Missions
   core::u64 nextMissionId{1};
@@ -141,6 +157,9 @@ struct SaveGame {
   std::vector<FactionBounty> bounties{};
   // Bounty vouchers earned for destroying criminals (redeem at stations).
   std::vector<FactionBounty> bountyVouchers{};
+
+  // Background NPC traffic simulation (for markets). Stores last simulated day per system.
+  std::vector<SystemTrafficStamp> trafficStamps{};
 
   std::vector<StationEconomyOverride> stationOverrides{};
 };

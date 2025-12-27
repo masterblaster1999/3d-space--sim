@@ -28,10 +28,26 @@ int test_streaming() {
   }
 
   if (!la.empty()) {
-    // getSystem without hint should still work because id encodes sector
-    const auto& sys = a.getSystem(la.front().id, &la.front());
-    const auto& sys2 = a.getSystem(la.front().id); // cached
-    if (sys.planets.size() != sys2.planets.size()) {
+    // getSystem should work without a hint stub because system ids encode the sector coordinate.
+    stellar::sim::Universe c(seed);
+
+    const auto& sysNoHint = c.getSystem(la.front().id);
+
+    const auto d = sysNoHint.stub.posLy - la.front().posLy;
+    if (d.length() > 1e-6) {
+      std::cerr << "[test_streaming] getSystem(no-hint) stub position mismatch\n";
+      ++fails;
+    }
+    if (sysNoHint.stub.primaryClass != la.front().primaryClass ||
+        sysNoHint.stub.planetCount != la.front().planetCount ||
+        sysNoHint.stub.stationCount != la.front().stationCount) {
+      std::cerr << "[test_streaming] getSystem(no-hint) stub fields mismatch\n";
+      ++fails;
+    }
+
+    // Cached access should remain stable.
+    const auto& sysCached = c.getSystem(la.front().id);
+    if (sysNoHint.planets.size() != sysCached.planets.size()) {
       std::cerr << "[test_streaming] cached system mismatch\n";
       ++fails;
     }

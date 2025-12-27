@@ -52,6 +52,8 @@ StationEconomyModel makeEconomyModel(StationType type, double bias) {
   D(CommodityId::Metals, 140);
   D(CommodityId::Ore, 180);
   D(CommodityId::Luxury, 25);
+  D(CommodityId::Weapons, 35);
+  D(CommodityId::Stimulants, 18);
 
   switch (type) {
     case StationType::Outpost:
@@ -65,11 +67,15 @@ StationEconomyModel makeEconomyModel(StationType type, double bias) {
       // produces food; consumes machinery/fuel.
       P(CommodityId::Food, 90 + 30 * std::max(0.0, -bias));
       P(CommodityId::Water, 12);
+      // Small pharma/agro-chemical output.
+      P(CommodityId::Stimulants, 6.0 + 3.0 * std::max(0.0, -bias));
       C(CommodityId::Fuel, 6);
       C(CommodityId::Machinery, 2);
       C(CommodityId::Electronics, 1);
+      C(CommodityId::Medicine, 0.5);
       D(CommodityId::Food, 700);
       D(CommodityId::Water, 350);
+      D(CommodityId::Stimulants, 35);
       break;
 
     case StationType::Mining:
@@ -96,20 +102,25 @@ StationEconomyModel makeEconomyModel(StationType type, double bias) {
       C(CommodityId::Fuel, 8);
       P(CommodityId::Machinery, 18 + 8 * std::max(0.0, bias));
       P(CommodityId::Electronics, 10 + 6 * std::max(0.0, bias));
+      P(CommodityId::Weapons, 5.5 + 2.5 * std::max(0.0, bias));
+      C(CommodityId::Stimulants, 0.6);
       D(CommodityId::Machinery, 350);
       D(CommodityId::Electronics, 300);
       D(CommodityId::Metals, 450);
+      D(CommodityId::Weapons, 140);
       break;
 
     case StationType::Research:
       C(CommodityId::Electronics, 5);
       C(CommodityId::Medicine, 2);
       C(CommodityId::Luxury, 1);
+      C(CommodityId::Stimulants, 0.8);
       C(CommodityId::Fuel, 3);
       P(CommodityId::Medicine, 4);
       D(CommodityId::Medicine, 250);
       D(CommodityId::Electronics, 250);
       D(CommodityId::Luxury, 120);
+      D(CommodityId::Stimulants, 60);
       break;
 
     case StationType::TradeHub:
@@ -122,7 +133,11 @@ StationEconomyModel makeEconomyModel(StationType type, double bias) {
       C(CommodityId::Machinery, 2);
       C(CommodityId::Metals, 4);
       C(CommodityId::Ore, 4);
+      C(CommodityId::Weapons, 1.2);
+      C(CommodityId::Stimulants, 1.0);
       D(CommodityId::Luxury, 80);
+      D(CommodityId::Weapons, 120);
+      D(CommodityId::Stimulants, 90);
       break;
 
     case StationType::Shipyard:
@@ -130,9 +145,11 @@ StationEconomyModel makeEconomyModel(StationType type, double bias) {
       C(CommodityId::Machinery, 30);
       C(CommodityId::Electronics, 18);
       C(CommodityId::Fuel, 10);
+      C(CommodityId::Weapons, 3.0);
       D(CommodityId::Metals, 900);
       D(CommodityId::Machinery, 700);
       D(CommodityId::Electronics, 600);
+      D(CommodityId::Weapons, 200);
       break;
 
     case StationType::Count:

@@ -1,0 +1,51 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "headless-release",
+      "displayName": "Headless Release (tests)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/headless-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STELLAR_ENABLE_RENDER": "OFF",
+        "STELLAR_ENABLE_IMGUI": "OFF"
+      }
+    },
+    {
+      "name": "game-release",
+      "displayName": "Game Release (SDL2/OpenGL)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/game-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STELLAR_ENABLE_RENDER": "ON",
+        "STELLAR_ENABLE_IMGUI": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "headless-release",
+      "configurePreset": "headless-release"
+    },
+    {
+      "name": "game-release",
+      "configurePreset": "game-release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "headless-release",
+      "configurePreset": "headless-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

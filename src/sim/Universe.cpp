@@ -25,6 +25,18 @@ static proc::SectorCoord decodeSector(SystemId id, core::u32& outLocalIndex) {
   return proc::SectorCoord{ unbias(bx), unbias(by), unbias(bz) };
 }
 
+static StarClass pickStarClass(core::SplitMix64& rng) {
+  const double r = rng.nextDouble();
+  // Very rough main-sequence-ish distribution.
+  if (r < 0.0003) return StarClass::O;
+  if (r < 0.0016) return StarClass::B;
+  if (r < 0.006)  return StarClass::A;
+  if (r < 0.03)   return StarClass::F;
+  if (r < 0.10)   return StarClass::G;
+  if (r < 0.30)   return StarClass::K;
+  return StarClass::M;
+}
+
 Universe::Universe(core::u64 seed, proc::GalaxyParams params)
 : seed_(seed),
   galaxyParams_(params),
@@ -130,17 +142,29 @@ const StarSystem& Universe::getSystem(SystemId id, const SystemStub* hintStub) {
           << " localIndex=" << localIndex << "). Generating fallback stub.";
       stellar::core::log(stellar::core::LogLevel::Warn, oss.str());
 
-      // Fallback: still deterministic from id + seed, but without real galaxy position.
+      // Fallback: deterministic from id + seed.
+      //
+      // We also synthesize a plausible disc position so legacy/unresolvable ids don't
+      // all collapse to the origin (which can make debugging/nav UI confusing).
       stub.id = id;
       stub.seed = core::hashCombine(seed_, static_cast<core::u64>(id));
       proc::NameGenerator ng(stub.seed);
       stub.name = ng.systemName();
-      stub.posLy = {0,0,0};
-      stub.primaryClass = StarClass::G;
-      stub.planetCount = 6;
-      stub.stationCount = 1;
+
+      core::SplitMix64 frng(core::hashCombine(stub.seed, core::seedFromText("fallback_stub")));
+
+      const double r = galaxyParams_.radiusLy * std::sqrt(frng.nextDouble());
+      const double a = frng.nextDouble() * 6.283185307179586;
+      const double z = (frng.nextDouble() - 0.5) * galaxyParams_.thicknessLy;
+      stub.posLy = { r * std::cos(a), r * std::sin(a), z };
+
+      stub.primaryClass = pickStarClass(frng);
+      stub.planetCount = frng.range(0, 12);
+      stub.stationCount = std::max(1, frng.range(0, 3));
       stub.factionId = 0;
       haveStub = true;
+
+
     }
   }
 

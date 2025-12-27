@@ -12,6 +12,9 @@ static const std::array<CommodityDef, kCommodityCount> kTable = {{
   {CommodityId::Medicine,    "MED",  "Medicine",    75.0,  0.5},
   {CommodityId::Electronics, "ELEC", "Electronics", 85.0,  0.5},
   {CommodityId::Luxury,      "LUX",  "Luxury",     120.0,  0.2},
+
+  {CommodityId::Weapons,     "ARMS", "Weapons",    150.0,  1.6},
+  {CommodityId::Stimulants,  "STIM", "Stimulants", 165.0,  0.2},
 }};
 
 const std::array<CommodityDef, kCommodityCount>& commodityTable() { return kTable; }

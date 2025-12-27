@@ -31,13 +31,37 @@ SectorCoord GalaxyGenerator::sectorOf(const math::Vec3d& posLy) const {
 }
 
 sim::SystemId GalaxyGenerator::makeSystemId(const SectorCoord& coord, core::u32 localIndex) const {
-  // Deterministic id from (seed, coord, index) with good mixing.
-  core::u64 h = seed_;
-  h = core::hashCombine(h, static_cast<core::u64>(static_cast<core::i64>(coord.x)));
-  h = core::hashCombine(h, static_cast<core::u64>(static_cast<core::i64>(coord.y)));
-  h = core::hashCombine(h, static_cast<core::u64>(static_cast<core::i64>(coord.z)));
-  h = core::hashCombine(h, static_cast<core::u64>(localIndex));
-  return static_cast<sim::SystemId>(h);
+  // Pack the sector coordinate + local index into 64 bits:
+  //   [x:16][y:16][z:16][i:16]
+  //
+  // This allows Universe::getSystem(id) to decode the sector directly from the id
+  // and stream/generate the correct sector on-demand (without requiring a hint stub).
+  //
+  // NOTE: Galaxy radius/sectorSize keep coords comfortably within +/- 32k sectors
+  // (default: 50k ly / 10 ly = 5k sectors), so a 16-bit biased encoding is safe.
+  if (coord.x < -32768 || coord.x > 32767 ||
+      coord.y < -32768 || coord.y > 32767 ||
+      coord.z < -32768 || coord.z > 32767) {
+    // Extremely out-of-range query; fall back to a hashed id (won't be decodable).
+    core::u64 h = seed_;
+    h = core::hashCombine(h, static_cast<core::u64>(static_cast<core::i64>(coord.x)));
+    h = core::hashCombine(h, static_cast<core::u64>(static_cast<core::i64>(coord.y)));
+    h = core::hashCombine(h, static_cast<core::u64>(static_cast<core::i64>(coord.z)));
+    h = core::hashCombine(h, static_cast<core::u64>(localIndex));
+    return static_cast<sim::SystemId>(h);
+  }
+
+  const auto bias = [](core::i32 v) -> core::u16 {
+    return static_cast<core::u16>(static_cast<core::i32>(v) + 32768);
+  };
+
+  const core::u64 bx = static_cast<core::u64>(bias(coord.x));
+  const core::u64 by = static_cast<core::u64>(bias(coord.y));
+  const core::u64 bz = static_cast<core::u64>(bias(coord.z));
+  const core::u64 bi = static_cast<core::u64>(static_cast<core::u16>(localIndex & 0xFFFFu));
+
+  const core::u64 id = (bx << 48) | (by << 32) | (bz << 16) | (bi << 0);
+  return static_cast<sim::SystemId>(id);
 }
 
 static int poisson(core::SplitMix64& rng, double mean) {

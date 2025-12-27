@@ -39,6 +39,7 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "shield " << s.shield << "\n";
   f << "heat " << s.heat << "\n";
   f << "cargoCapacityKg " << s.cargoCapacityKg << "\n";
+  f << "passengerSeats " << s.passengerSeats << "\n";
   f << "fsdReadyDay " << s.fsdReadyDay << "\n";
 
   // Loadout / progression
@@ -48,6 +49,7 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "distributorMk " << (int)s.distributorMk << "\n";
   f << "weaponPrimary " << (int)s.weaponPrimary << "\n";
   f << "weaponSecondary " << (int)s.weaponSecondary << "\n";
+  f << "smuggleHoldMk " << (int)s.smuggleHoldMk << "\n";
 
   f << "cargo";
   for (double u : s.cargo) f << " " << u;
@@ -127,6 +129,12 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "bounty_vouchers " << s.bountyVouchers.size() << "\n";
   for (const auto& v : s.bountyVouchers) {
     f << "voucher " << v.factionId << " " << v.bountyCr << "\n";
+  }
+
+  // Background NPC traffic day stamps (per visited system)
+  f << "trafficStamps " << s.trafficStamps.size() << "\n";
+  for (const auto& t : s.trafficStamps) {
+    f << "traffic " << t.systemId << " " << t.dayStamp << "\n";
   }
 
   f << "station_overrides " << s.stationOverrides.size() << "\n";
@@ -212,6 +220,8 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.heat;
     } else if (key == "cargoCapacityKg") {
       f >> out.cargoCapacityKg;
+    } else if (key == "passengerSeats") {
+      f >> out.passengerSeats;
     } else if (key == "fsdReadyDay") {
       f >> out.fsdReadyDay;
     } else if (key == "shipHull") {
@@ -238,8 +248,21 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       int v = 0;
       f >> v;
       out.weaponSecondary = (core::u8)std::clamp(v, 0, 255);
+    } else if (key == "smuggleHoldMk") {
+      int v = 0;
+      f >> v;
+      out.smuggleHoldMk = (core::u8)std::clamp(v, 0, 255);
     } else if (key == "cargo") {
-      for (std::size_t i = 0; i < econ::kCommodityCount; ++i) f >> out.cargo[i];
+      // Cargo line can grow over time as new commodities are added.
+      // Read the rest of the line and fill missing entries with 0 so older saves stay loadable.
+      std::string line;
+      std::getline(f, line);
+      std::istringstream iss(line);
+      for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+        double v = 0.0;
+        if (iss >> v) out.cargo[i] = v;
+        else out.cargo[i] = 0.0;
+      }
     } else if (key == "explorationDataCr") {
       f >> out.explorationDataCr;
     } else if (key == "scannedKeys") {
@@ -420,6 +443,25 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         if (!(f >> v.factionId >> v.bountyCr)) break;
         out.bountyVouchers.push_back(std::move(v));
       }
+    } else if (key == "trafficStamps") {
+      std::size_t n = 0;
+      f >> n;
+      out.trafficStamps.clear();
+      out.trafficStamps.reserve(n);
+
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "traffic") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+        SystemTrafficStamp t{};
+        if (!(f >> t.systemId >> t.dayStamp)) break;
+        out.trafficStamps.push_back(std::move(t));
+      }
     } else if (key == "station_overrides") {
       std::size_t n = 0;
       f >> n;
@@ -440,7 +482,16 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
           } else if (sk == "lastSampleDay") {
             f >> ov.state.lastSampleDay;
           } else if (sk == "inventory") {
-            for (std::size_t i = 0; i < econ::kCommodityCount; ++i) f >> ov.state.inventory[i];
+            // Like player cargo, station inventory lines can grow as commodities are added.
+            // Parse the remainder of the line and default missing values to 0.
+            std::string line;
+            std::getline(f, line);
+            std::istringstream iss(line);
+            for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+              double v = 0.0;
+              if (iss >> v) ov.state.inventory[i] = v;
+              else ov.state.inventory[i] = 0.0;
+            }
           } else if (sk == "history") {
             std::size_t cid = 0;
             std::size_t count = 0;
