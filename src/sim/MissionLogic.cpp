@@ -15,6 +15,96 @@
 
 namespace stellar::sim {
 
+struct CargoMissionSpec {
+  econ::CommodityId commodity{econ::CommodityId::Food};
+  int units{0};
+  econ::MarketQuote originQ{};
+  econ::MarketQuote destQ{};
+};
+
+// Pick a commodity + unit count for a cargo-style mission.
+//
+// Goals:
+//  - Prefer goods that are in higher demand at the destination (dest mid > origin mid).
+//  - Ensure the origin station has enough inventory for the chosen unit count.
+//  - Avoid generating missions that would be contradictory to contraband rules.
+static bool pickCargoMission(core::SplitMix64& rng,
+                             core::u64 universeSeed,
+                             const econ::StationEconomyState& originState,
+                             const econ::StationEconomyModel& originModel,
+                             const econ::StationEconomyState& destState,
+                             const econ::StationEconomyModel& destModel,
+                             core::u32 destFactionId,
+                             bool requireLegalAtDest,
+                             bool cargoProvided,
+                             double maxCargoKg,
+                             int minUnits,
+                             int maxUnitsHard,
+                             CargoMissionSpec& out) {
+  struct Cand {
+    econ::CommodityId id{econ::CommodityId::Food};
+    double score{0.0};
+    econ::MarketQuote o{};
+    econ::MarketQuote d{};
+    int maxUnits{0};
+  };
+
+  minUnits = std::max(1, minUnits);
+  maxUnitsHard = std::max(minUnits, maxUnitsHard);
+  maxCargoKg = std::max(0.2, maxCargoKg);
+
+  // Provided cargo should be limited to avoid draining the station economy too aggressively.
+  const double invFrac = cargoProvided ? 0.28 : 0.80;
+
+  std::vector<Cand> cands;
+  cands.reserve(econ::kCommodityCount);
+
+  for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+    const auto cid = static_cast<econ::CommodityId>(i);
+
+    if (requireLegalAtDest && isIllegalCommodity(universeSeed, destFactionId, cid)) continue;
+
+    const auto oq = econ::quote(originState, originModel, cid, 0.10);
+    const auto dq = econ::quote(destState, destModel, cid, 0.10);
+
+    if (oq.inventory < 1.0) continue;
+
+    const double massKg = std::max(1e-6, econ::commodityDef(cid).massKg);
+    const int maxByKg = (int)std::floor(maxCargoKg / massKg);
+    const int maxByInv = (int)std::floor(std::max(0.0, oq.inventory) * invFrac);
+    const int maxUnits = std::min(maxUnitsHard, std::min(maxByKg, maxByInv));
+
+    if (maxUnits < minUnits) continue;
+
+    // Score cargo by demand: destination mid-price relative to origin mid-price.
+    // Also bias slightly towards higher-value goods so boards aren't always dominated by
+    // ultra-bulky low-value commodities.
+    const double ratio = dq.mid / std::max(1e-6, oq.mid);
+    const double valueBias = 0.65 + 0.35 * std::min(1.0, dq.mid / 120.0);
+    const double score = ratio * valueBias;
+
+    cands.push_back(Cand{cid, score, oq, dq, maxUnits});
+  }
+
+  if (cands.empty()) return false;
+
+  std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+    if (a.score != b.score) return a.score > b.score;
+    return (int)a.id < (int)b.id;
+  });
+
+  const int top = std::min<int>(3, (int)cands.size());
+  const int pick = (top <= 1) ? 0 : rng.range(0, top - 1);
+  const Cand& c = cands[(std::size_t)pick];
+
+  const int units = rng.range(minUnits, c.maxUnits);
+  out.commodity = c.id;
+  out.units = units;
+  out.originQ = c.o;
+  out.destQ = c.d;
+  return true;
+}
+
 static int activePassengerCount(const SaveGame& s) {
   int n = 0;
   for (const auto& m : s.missions) {
@@ -62,6 +152,19 @@ void refreshMissionOffers(Universe& universe,
   const int offerCount = std::clamp(baseCount, params.minOfferCount, params.maxOfferCount);
 
   const double repScale = 1.0 + std::clamp(playerRep, 0.0, 100.0) / 100.0 * params.repRewardBonus;
+
+  // Used for pricing delivery missions that require purchasing cargo.
+  const double feeEff = applyReputationToFeeRate(dockedStation.feeRate, playerRep);
+
+  // Cache origin economy snapshot for this refresh.
+  auto& originEcon = universe.stationEconomy(dockedStation, timeDays);
+
+  // Ship-fit: tailor offer payload sizes to the player's current ship capacity.
+  // For cargo missions that grant cargo immediately on acceptance, we use the *free*
+  // cargo space so the board avoids generating offers the player can't accept right now.
+  const double cargoFreeKg = std::max(0.0, ioSave.cargoCapacityKg - econ::cargoMassKg(ioSave.cargo));
+  const double cargoCapKg = std::max(0.0, ioSave.cargoCapacityKg);
+  const int freeSeats = std::max(0, ioSave.passengerSeats - activePassengerCount(ioSave));
 
     // Precompute cumulative weight thresholds once (the RNG is deterministic per board seed).
   const double tCourier = params.wCourier;
@@ -135,30 +238,167 @@ void refreshMissionOffers(Universe& universe,
       m.reward = 350.0 + distLy * 110.0;
     } else if (type == MissionType::Delivery) {
       m.type = MissionType::Delivery;
-      m.commodity = (econ::CommodityId)(mrng.nextU32() % (core::u32)econ::kCommodityCount);
-      m.units = 25 + (mrng.nextU32() % 120);
-      m.reward = 250.0 + distLy * 120.0 + (double)m.units * 6.0;
       m.cargoProvided = (mrng.nextUnit() < 0.25);
+
+      // Ship-fit: cargo missions grant cargo immediately on acceptance, so only generate
+      // jobs that fit into the player's current free cargo space.
+      const double freeKg = cargoFreeKg;
+      if (freeKg + 1e-9 < 0.2) {
+        // Hold is effectively full (or too small to carry any commodity); keep the board usable.
+        m.type = MissionType::Courier;
+        m.reward = 330.0 + distLy * 115.0;
+      } else {
+        const double maxCargoKg = std::min(260.0, freeKg * 0.95);
+        const int minUnits = std::clamp((int)std::floor(freeKg / 30.0), 1, 12);
+        const int maxUnitsHard = std::clamp((int)std::floor(freeKg / 1.2), 6, 180);
+
+        // Economy-aware cargo selection. Ensure we don't ask the player to deliver contraband
+        // as a "legal" delivery job.
+        CargoMissionSpec spec{};
+        bool ok = false;
+        if (destSt) {
+          auto& destEcon = universe.stationEconomy(*destSt, timeDays);
+          ok = pickCargoMission(mrng,
+                                universe.seed(),
+                                originEcon,
+                                dockedStation.economyModel,
+                                destEcon,
+                                destSt->economyModel,
+                                destSt->factionId,
+                                /*requireLegalAtDest=*/true,
+                                /*cargoProvided=*/m.cargoProvided,
+                                /*maxCargoKg=*/maxCargoKg,
+                                /*minUnits=*/minUnits,
+                                /*maxUnitsHard=*/maxUnitsHard,
+                                spec);
+        }
+
+        if (!ok) {
+          // Fallback: if the economy can't support a cargo job right now, degrade to courier.
+          m.type = MissionType::Courier;
+          m.reward = 330.0 + distLy * 115.0;
+        } else {
+          m.commodity = spec.commodity;
+          m.units = (double)spec.units;
+
+          const double base = 250.0 + distLy * 58.0 + mrng.range(0.0, 140.0);
+
+          if (m.cargoProvided) {
+            // Provided cargo: payout is more "service" oriented; scale with destination price.
+            m.reward = base + spec.destQ.bid * (double)spec.units * 0.55;
+          } else {
+            // Purchased cargo: ensure missions are meaningfully profitable even for high-value goods.
+            const double cost = spec.originQ.ask * (double)spec.units * (1.0 + feeEff);
+            const double margin = 0.18 + mrng.range(0.0, 0.08);
+            m.reward = base + cost * (1.0 + margin);
+          }
+        }
+      }
     } else if (type == MissionType::MultiDelivery) {
       m.type = MissionType::MultiDelivery;
-      m.commodity = (econ::CommodityId)(mrng.nextU32() % (core::u32)econ::kCommodityCount);
-      m.units = 20 + (mrng.nextU32() % 100);
-      m.reward = 400.0 + distLy * 150.0 + (double)m.units * 8.0;
       m.cargoProvided = (mrng.nextUnit() < 0.35);
 
-      // Pick a via system/station (try to avoid picking the same destination).
-      for (int tries = 0; tries < 8; ++tries) {
-        const auto viaStub = dests[(std::size_t)(mrng.nextU32() % (core::u32)dests.size())];
-        if (viaStub.id == destStub.id) continue;
-        const auto& viaSys = universe.getSystem(viaStub.id, &viaStub);
-        if (viaSys.stations.empty()) continue;
-        const auto& viaSt = viaSys.stations[(std::size_t)(mrng.nextU32() % (core::u32)viaSys.stations.size())];
-        m.viaSystem = viaStub.id;
-        m.viaStation = viaSt.id;
-        break;
+      // Multi-hop deliveries grant cargo immediately on acceptance; size them to the player's
+      // current free cargo capacity to avoid impossible offers.
+      const double freeKg = cargoFreeKg;
+      if (freeKg + 1e-9 < 0.2) {
+        m.type = MissionType::Courier;
+        m.reward = 360.0 + distLy * 120.0;
+      } else {
+        const double maxCargoKg = std::min(240.0, freeKg * 0.90);
+        const int minUnits = std::clamp((int)std::floor(freeKg / 35.0), 1, 10);
+        const int maxUnitsHard = std::clamp((int)std::floor(freeKg / 1.4), 6, 160);
+
+        // Pick a cargo load that makes sense for the final destination's market.
+        CargoMissionSpec spec{};
+        bool ok = false;
+        if (destSt) {
+          auto& destEcon = universe.stationEconomy(*destSt, timeDays);
+          ok = pickCargoMission(mrng,
+                                universe.seed(),
+                                originEcon,
+                                dockedStation.economyModel,
+                                destEcon,
+                                destSt->economyModel,
+                                destSt->factionId,
+                                /*requireLegalAtDest=*/true,
+                                /*cargoProvided=*/m.cargoProvided,
+                                /*maxCargoKg=*/maxCargoKg,
+                                /*minUnits=*/minUnits,
+                                /*maxUnitsHard=*/maxUnitsHard,
+                                spec);
+        }
+
+        if (!ok) {
+          // Fallback: keep the board populated.
+          m.type = MissionType::Courier;
+          m.reward = 360.0 + distLy * 120.0;
+        } else {
+          m.commodity = spec.commodity;
+          m.units = (double)spec.units;
+
+          // Pick a via system/station. Prefer routes that aren't extreme detours.
+          SystemStub viaStub{};
+          const Station* viaSt = nullptr;
+          double routeLy = 0.0;
+
+          const double directLy = std::max(1e-6, distLy);
+          for (int tries = 0; tries < 18; ++tries) {
+            const auto candStub = dests[(std::size_t)(mrng.nextU32() % (core::u32)dests.size())];
+            if (candStub.id == destStub.id) continue;
+
+            const double d1 = (candStub.posLy - currentSystem.stub.posLy).length();
+            const double d2 = (destStub.posLy - candStub.posLy).length();
+            const double route = d1 + d2;
+            const double detour = route / directLy;
+            if (detour > 2.25) continue;
+
+            const auto& candSys = universe.getSystem(candStub.id, &candStub);
+            if (candSys.stations.empty()) continue;
+            const auto& candSt = candSys.stations[(std::size_t)(mrng.nextU32() % (core::u32)candSys.stations.size())];
+
+            if (!viaSt || route < routeLy) {
+              viaStub = candStub;
+              viaSt = &candSt;
+              routeLy = route;
+            }
+          }
+
+          if (!viaSt) {
+            // Couldn't find a reasonable intermediate stop; downgrade to a normal delivery.
+            m.type = MissionType::Delivery;
+
+            const double base = 270.0 + distLy * 60.0 + mrng.range(0.0, 160.0);
+            if (m.cargoProvided) {
+              m.reward = base + spec.destQ.bid * (double)spec.units * 0.55;
+            } else {
+              const double cost = spec.originQ.ask * (double)spec.units * (1.0 + feeEff);
+              const double margin = 0.18 + mrng.range(0.0, 0.08);
+              m.reward = base + cost * (1.0 + margin);
+            }
+
+            // Keep the direct-leg deadline picked above.
+          } else {
+            m.viaSystem = viaStub.id;
+            m.viaStation = viaSt->id;
+
+            // Reward/deadline scale with the actual route distance (origin->via + via->dest),
+            // plus a small "extra stop" premium.
+            const double base = 380.0 + routeLy * 70.0 + mrng.range(0.0, 220.0);
+
+            if (m.cargoProvided) {
+              m.reward = base + spec.destQ.bid * (double)spec.units * 0.65;
+            } else {
+              const double cost = spec.originQ.ask * (double)spec.units * (1.0 + feeEff);
+              const double margin = 0.22 + mrng.range(0.0, 0.10);
+              m.reward = base + cost * (1.0 + margin);
+            }
+
+            m.reward += 140.0 + mrng.range(0.0, 70.0);
+            m.deadlineDay = timeDays + 2.05 + routeLy / 18.0 + mrng.range(0.0, 0.25);
+          }
+        }
       }
-      // Slightly longer default deadline for multi-hop.
-      m.deadlineDay = timeDays + 2.0 + distLy / 18.0;
     } else if (type == MissionType::Salvage) {
       m.type = MissionType::Salvage;
 
@@ -170,29 +410,55 @@ void refreshMissionOffers(Universe& universe,
         econ::CommodityId::Luxury,
       };
 
-      m.commodity = kSalvage[(std::size_t)(mrng.nextU32() % (core::u32)kSalvage.size())];
-      m.units = 3 + (mrng.nextU32() % 12);
+      // Ensure the requested salvage can fit in the player's cargo hold (at completion time).
+      const double capKg = cargoCapKg;
+      bool ok = false;
 
-      const double base = econ::commodityDef(m.commodity).basePrice;
-      m.reward = 520.0 + (double)m.units * base * 1.05 + mrng.range(0.0, 180.0);
+      for (int tries = 0; tries < 8; ++tries) {
+        m.commodity = kSalvage[(std::size_t)(mrng.nextU32() % (core::u32)kSalvage.size())];
+        const double massKg = std::max(1e-6, econ::commodityDef(m.commodity).massKg);
+        const int maxByKg = (int)std::floor(capKg / massKg + 1e-9);
+        if (maxByKg >= 1) {
+          const int maxUnits = std::clamp(maxByKg, 1, 18);
+          const int minUnits = std::min(3, maxUnits);
+          m.units = (double)mrng.range(minUnits, maxUnits);
+          ok = true;
+          break;
+        }
+      }
 
-      // Reuse targetNpcId as a stable "signal id" so the game can spawn/track the mission site.
-      m.targetNpcId = (mrng.nextU64() | 0x8000000000000000ull);
-      m.cargoProvided = false;
+      if (!ok) {
+        // If the ship can't carry any salvage at all, keep the board usable.
+        m.type = MissionType::Courier;
+        m.reward = 360.0;
+      } else {
+        const double base = econ::commodityDef(m.commodity).basePrice;
+        m.reward = 520.0 + (double)m.units * base * 1.05 + mrng.range(0.0, 180.0);
+
+        // Reuse targetNpcId as a stable "signal id" so the game can spawn/track the mission site.
+        m.targetNpcId = (mrng.nextU64() | 0x8000000000000000ull);
+        m.cargoProvided = false;
+      }
     } else if (type == MissionType::Passenger) {
-      m.type = MissionType::Passenger;
-      // units is interpreted as "passenger count" for Passenger missions.
-      m.units = 1 + (mrng.nextU32() % 8);
-      // Reward scales with distance and party size.
-      m.reward = 450.0 + distLy * 125.0 + (double)m.units * 85.0;
-      // Slightly tighter deadline than courier to encourage routing decisions.
-      m.deadlineDay = timeDays + 0.9 + distLy / 24.0;
-      m.cargoProvided = false;
+      // Ship-fit: only offer passenger party sizes that the player can accept right now.
+      const int maxParty = std::min(6, freeSeats);
+      if (maxParty <= 0) {
+        m.type = MissionType::Courier;
+        m.reward = 340.0 + distLy * 118.0;
+      } else {
+        m.type = MissionType::Passenger;
+        // units is interpreted as "passenger count" for Passenger missions.
+        m.units = (double)mrng.range(1, maxParty);
+        // Reward scales with distance and party size.
+        m.reward = 450.0 + distLy * 125.0 + (double)m.units * 85.0;
+        // Slightly tighter deadline than courier to encourage routing decisions.
+        m.deadlineDay = timeDays + 0.9 + distLy / 24.0;
+        m.cargoProvided = false;
+      }
     } else if (type == MissionType::Smuggle) {
       m.type = MissionType::Smuggle;
 
-      // Pick a commodity that is illegal in the destination's jurisdiction.
-      // Smuggling jobs are treated as "cargo provided" by the contact (not drawn from open-market inventory).
+      // Smuggling jobs should only exist where there is actual contraband.
       const core::u32 destFaction = destSt ? destSt->factionId : 0;
       const core::u32 mask = illegalCommodityMask(universe.seed(), destFaction);
 
@@ -202,18 +468,54 @@ void refreshMissionOffers(Universe& universe,
         if ((mask & ((core::u32)1u << (core::u32)c)) != 0u) illegal.push_back((econ::CommodityId)c);
       }
 
-      if (!illegal.empty() && destFaction != 0) {
-        m.commodity = illegal[(std::size_t)(mrng.nextU32() % (core::u32)illegal.size())];
+      if (destFaction == 0 || illegal.empty()) {
+        // No contraband rules here; downgrade to a normal courier job.
+        m.type = MissionType::Courier;
+        m.reward = 340.0 + distLy * 118.0;
       } else {
-        // Fallback: if the destination has no contraband rules, pick any commodity.
-        m.commodity = (econ::CommodityId)(mrng.nextU32() % (core::u32)econ::kCommodityCount);
-      }
+        // Ship-fit: smuggling grants cargo immediately on acceptance, so filter to commodities that
+        // can actually fit in the player's *current* free hold.
+        const double freeKg = cargoFreeKg;
 
-      // Contraband shipments are smaller but higher margin.
-      m.units = 10 + (mrng.nextU32() % 45);
-      m.reward = 650.0 + distLy * 155.0 + (double)m.units * 18.0;
-      m.deadlineDay = timeDays + 1.2 + distLy / 19.0;
-      m.cargoProvided = true;
+        std::vector<econ::CommodityId> fitIllegal;
+        fitIllegal.reserve(illegal.size());
+        for (const auto cid : illegal) {
+          const double massKg = std::max(1e-6, econ::commodityDef(cid).massKg);
+          if (massKg <= freeKg * 0.95 + 1e-9) fitIllegal.push_back(cid);
+        }
+
+        if (fitIllegal.empty()) {
+          // Not enough free capacity to accept even 1 unit of any contraband.
+          m.type = MissionType::Courier;
+          m.reward = 340.0 + distLy * 118.0;
+        } else {
+          m.commodity = fitIllegal[(std::size_t)(mrng.nextU32() % (core::u32)fitIllegal.size())];
+
+          const double massKg = std::max(1e-6, econ::commodityDef(m.commodity).massKg);
+          const int maxByKg = (int)std::floor((freeKg * 0.95) / massKg + 1e-9);
+          const int maxUnits = std::clamp(maxByKg, 1, 55);
+
+          const int minUnits = std::min(8, maxUnits);
+          const int units = mrng.range(minUnits, maxUnits);
+          m.units = (double)units;
+
+          // Smuggling cargo is provided by the contact (not drawn from open-market inventory).
+          m.cargoProvided = true;
+
+          // Reward scales with destination price (risk/interest) + distance.
+          double destMid = econ::commodityDef(m.commodity).basePrice;
+          if (destSt) {
+            auto& destEcon = universe.stationEconomy(*destSt, timeDays);
+            destMid = econ::quote(destEcon, destSt->economyModel, m.commodity, 0.10).mid;
+          }
+
+          m.reward = 720.0
+                   + distLy * 170.0
+                   + destMid * (double)units * 0.28
+                   + mrng.range(0.0, 220.0);
+          m.deadlineDay = timeDays + 1.15 + distLy / 20.0;
+        }
+      }
     } else if (type == MissionType::BountyScan) {
       m.type = MissionType::BountyScan;
       m.targetNpcId = std::max<core::u64>(1, mrng.nextU64());

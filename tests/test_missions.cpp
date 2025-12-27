@@ -2,9 +2,11 @@
 
 #include "stellar/econ/Cargo.h"
 #include "stellar/econ/Market.h"
+#include "stellar/sim/Contraband.h"
 #include "stellar/sim/Reputation.h"
 #include "stellar/sim/Universe.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 
@@ -69,6 +71,136 @@ int test_missions() {
       if (ma.type != mb.type || ma.toSystem != mb.toSystem || ma.toStation != mb.toStation) {
         std::cerr << "[test_missions] deterministic offers content mismatch\n";
         ++fails;
+      }
+    }
+
+    // Basic sanity checks on generated offers (legality + profitability for buy-to-deliver jobs).
+    // These are intentionally lightweight: they catch regressions where mission rewards end up
+    // below the expected acquisition cost for high-value cargo.
+    auto findStationById = [](const StarSystem& sys, sim::StationId id) -> const sim::Station* {
+      for (const auto& st : sys.stations) {
+        if (st.id == id) return &st;
+      }
+      return nullptr;
+    };
+
+    auto& originEcon = u.stationEconomy(station, a.timeDays);
+    const double feeEff = applyReputationToFeeRate(station.feeRate, /*rep*/0.0);
+
+    double freeKg = a.cargoCapacityKg - econ::cargoMassKg(a.cargo);
+    if (freeKg < 0.0) freeKg = 0.0;
+
+    for (const auto& m : a.missionOffers) {
+      // Ship-fit sanity: generated offers should be accept-able given the player's current ship capacity.
+      if (m.type == MissionType::Passenger) {
+        const int party = std::max(0, (int)std::llround(m.units));
+        if (party > a.passengerSeats) {
+          std::cerr << "[test_missions] passenger offer exceeds seat capacity\n";
+          ++fails;
+        }
+      }
+
+      if ((m.type == MissionType::Delivery || m.type == MissionType::MultiDelivery || m.type == MissionType::Smuggle) && m.units > 0.0) {
+        const double massKg = econ::commodityDef(m.commodity).massKg;
+        const double needKg = massKg * m.units;
+        if (needKg > freeKg + 1e-6) {
+          std::cerr << "[test_missions] cargo offer exceeds free cargo capacity\n";
+          ++fails;
+        }
+      }
+
+      if (m.type == MissionType::Salvage && m.units > 0.0) {
+        const double massKg = econ::commodityDef(m.commodity).massKg;
+        const double needKg = massKg * m.units;
+        if (needKg > a.cargoCapacityKg + 1e-6) {
+          std::cerr << "[test_missions] salvage offer exceeds cargo capacity\n";
+          ++fails;
+        }
+      }
+
+      if (m.type == MissionType::Smuggle) {
+        const auto& ds = u.getSystem(m.toSystem);
+        const auto* dst = findStationById(ds, m.toStation);
+        if (dst && dst->factionId != 0) {
+          if (!isIllegalCommodity(u.seed(), dst->factionId, m.commodity)) {
+            std::cerr << "[test_missions] smuggle mission commodity not illegal at destination\n";
+            ++fails;
+          }
+        }
+      }
+
+      if (m.type == MissionType::Delivery || m.type == MissionType::MultiDelivery) {
+        const auto& ds = u.getSystem(m.toSystem);
+        const auto* dst = findStationById(ds, m.toStation);
+        if (dst && dst->factionId != 0) {
+          if (isIllegalCommodity(u.seed(), dst->factionId, m.commodity)) {
+            std::cerr << "[test_missions] delivery mission requests illegal cargo at destination\n";
+            ++fails;
+          }
+        }
+
+        if (!m.cargoProvided) {
+          const auto q = econ::quote(originEcon, station.economyModel, m.commodity, 0.10);
+          const double cost = q.ask * m.units * (1.0 + feeEff);
+          if (m.reward + 1e-6 < cost * 1.05) {
+            std::cerr << "[test_missions] delivery mission reward too low vs acquisition cost\n";
+            ++fails;
+          }
+        }
+      }
+    }
+  }
+
+  // Ship-fit mission boards: passenger offers should not appear if the ship has zero seats.
+  {
+    SaveGame p = s;
+    p.passengerSeats = 0;
+
+    refreshMissionOffers(u, sys, station, p.timeDays, /*rep*/0.0, p);
+    for (const auto& m : p.missionOffers) {
+      if (m.type == MissionType::Passenger) {
+        std::cerr << "[test_missions] expected no passenger offers when passengerSeats == 0\n";
+        ++fails;
+      }
+    }
+  }
+
+  // Ship-fit mission boards: cargo-bearing offers should respect small cargo capacities.
+  {
+    SaveGame p = s;
+    p.cargoCapacityKg = 12.0;
+    // Keep cargo empty so free space == capacity.
+
+    refreshMissionOffers(u, sys, station, p.timeDays, /*rep*/0.0, p);
+
+    double freeKg = p.cargoCapacityKg - econ::cargoMassKg(p.cargo);
+    if (freeKg < 0.0) freeKg = 0.0;
+
+    for (const auto& m : p.missionOffers) {
+      if ((m.type == MissionType::Delivery || m.type == MissionType::MultiDelivery || m.type == MissionType::Smuggle) && m.units > 0.0) {
+        const double massKg = econ::commodityDef(m.commodity).massKg;
+        const double needKg = massKg * m.units;
+        if (needKg > freeKg + 1e-6) {
+          std::cerr << "[test_missions] small-hold cargo offer exceeds free cargo capacity\n";
+          ++fails;
+        }
+      }
+
+      if (m.type == MissionType::Salvage && m.units > 0.0) {
+        const double massKg = econ::commodityDef(m.commodity).massKg;
+        const double needKg = massKg * m.units;
+        if (needKg > p.cargoCapacityKg + 1e-6) {
+          std::cerr << "[test_missions] small-hold salvage offer exceeds cargo capacity\n";
+          ++fails;
+        }
+      }
+
+      if (m.type == MissionType::Passenger) {
+        const int party = std::max(0, (int)std::llround(m.units));
+        if (party > p.passengerSeats) {
+          std::cerr << "[test_missions] small-hold passenger offer exceeds seat capacity\n";
+          ++fails;
+        }
       }
     }
   }

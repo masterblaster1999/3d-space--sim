@@ -1,3 +1,17 @@
+## 2025-12-27 (Patch) - Ship-fit mission boards + route-aware multi-hop tuning
+- **Mission Board:** cargo-bearing offers (Delivery / Multi-hop / Smuggle) now size their payload to the player's **current free cargo capacity**, so generated jobs are accept-able immediately without dumping cargo.
+- **Passengers:** passenger offers now respect available **seat capacity** (no more 6-person offers on a 2-seat ship).
+- **Multi-hop routing:** Multi-delivery via stops are chosen to avoid **extreme detours**, and payouts/deadlines now scale with the **full route distance** (origin→via→destination).
+- **Salvage:** salvage offer quantities are capped to ensure the requested goods can **fit in your hold** at completion time.
+- **Tests:** expanded `test_missions` with ship-capacity sanity checks for mission-board generation.
+
+## 2025-12-27 (Patch) - Economy-aware delivery missions (profit + legality fixes)
+- **Mission Board (core):** Delivery and Multi-delivery cargo is now picked using **origin/destination market prices** (demand-aware), instead of being fully random.
+- **Legality:** "legal" delivery missions will no longer ask you to deliver **contraband** into a destination jurisdiction where it's illegal (those are now reserved for **Smuggle** jobs).
+- **Rewards:** Delivery payouts now scale with the cargo's expected **acquisition cost/value**, preventing negative-profit jobs for high-value commodities.
+- **Smuggling:** Smuggle offers now only appear when the destination faction actually has contraband rules; otherwise the offer downgrades to a normal courier job.
+- **Tests:** expanded `test_missions` with lightweight checks for delivery legality/profitability and smuggling legality.
+
 ## 2025-12-27 (Patch) - Salvage recovery missions + mission derelict sites
 - **Missions:** added a new **Salvage** mission type.
   - Salvage jobs spawn a **mission derelict** signal in-system; recover the requested goods and return to the station for payout.
