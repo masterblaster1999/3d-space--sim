@@ -104,6 +104,20 @@ struct SphereTarget {
   //    engine load, etc.) into this scalar.
   double heatSignature{1.0};
 
+  // Optional radar signature used by radar seekers.
+  //
+  // This is an arbitrary-unit scalar that scales the attractiveness of a
+  // non-decoy target to radar seekers (and can be used to model approximate
+  // radar cross-section differences between ships).
+  //
+  // Design notes:
+  //  - It is intended to be in roughly the same magnitude range as
+  //    SphereTarget::decoyRadar so chaff can meaningfully compete.
+  //  - 1.0 preserves legacy behavior (all targets equal for radar seekers).
+  //  - 0.0 can be used to represent a stealth or otherwise radar-difficult
+  //    contact for seeker logic.
+  double radarSignature{1.0};
+
   // Optional electronic-warfare noise jammer emission strength.
   // Only meaningful for kind == Ship or Player.
   //
@@ -291,6 +305,16 @@ struct Missile {
   // 0.0 means the seeker is active immediately (default).
   double seekerActivationSimSec{0.0};
 
+  // Optional: active seeker update period (sim seconds).
+  //
+  // When > 0, the seeker produces fresh measurements at discrete intervals after activation.
+  // Between updates, guidance falls back to inertial target memory (if enabled) and decoy/
+  // reacquire decisions are deferred until the next update tick.
+  //
+  // 0 -> continuous updates (legacy behavior).
+  double seekerUpdatePeriodSimSec{0.0};
+
+
   // Optional midcourse datalink maximum range (km).
   //
   // When > 0 and the seeker is not yet active (seekerActivationSimSec > 0), the missile
@@ -299,6 +323,26 @@ struct Missile {
   //
   // When 0, midcourse guidance behaves like a perfect datalink (legacy behavior).
   double datalinkRangeKm{0.0};
+
+  // Optional midcourse datalink update period (sim seconds).
+  //
+  // When > 0 and the seeker is not yet active (seekerActivationSimSec > 0), the
+  // missile only ingests fresh target updates on discrete ticks.
+  // Between ticks, guidance falls back to inertial target memory.
+  //
+  // 0 -> continuous midcourse updates (legacy behavior).
+  double datalinkUpdatePeriodSimSec{0.0};
+
+  // Optional midcourse datalink latency (sim seconds).
+  //
+  // Only meaningful when datalinkUpdatePeriodSimSec > 0.
+  // Datalink updates are considered to "arrive" at:
+  //   t = datalinkLatencySimSec + n*datalinkUpdatePeriodSimSec
+  // (with an initial guidance fix at launch).
+  //
+  // This delays the missile's reaction to abrupt target maneuvers in the
+  // midcourse phase without introducing nondeterministic packet loss.
+  double datalinkLatencySimSec{0.0};
 
   // Optional: line-of-sight requirement for midcourse datalink updates.
   //
@@ -336,6 +380,26 @@ struct Missile {
   // 0.0 disables slew limiting (instant pointing).
   double seekerSlewRateRadS{0.0};
 
+  // Optional: seeker pointing lag can directly affect guidance (deterministic).
+  //
+  // By default, seeker gimbal slew primarily impacts *track quality* (and therefore
+  // decoy resistance / measurement noise), while the guidance loop continues to
+  // use idealized line-of-sight geometry. When enabled, the missile blends its
+  // commanded steering direction toward its internal seeker pointing direction.
+  //
+  // This is a lightweight approximation of a real guidance loop that relies on a
+  // lagged seeker measurement: high line-of-sight rates can create true guidance
+  // error (not just "lower lock quality"), improving the gameplay value of sharp
+  // jinks at close range.
+  //
+  // Enable by setting seekerLagGuidanceGain > 0 along with seekerSlewRateRadS > 0.
+  //
+  // The blend factor is derived from the seeker's instantaneous misalignment to
+  // the true line-of-sight, scaled by this gain and clamped to [0,1].
+  //
+  // 0.0 disables (legacy behavior).
+  double seekerLagGuidanceGain{0.0};
+
   // Internal: current seeker pointing direction in world space.
   // Not serialized/persisted.
   bool hasSeekerDir{false};
@@ -344,6 +408,29 @@ struct Missile {
   //   targetScore * decoyResistance
   // to override guidance.
   double decoyResistance{1.0};
+
+
+  // Optional heat-seeker aspect sensitivity.
+  //
+  // Real IR seekers tend to see a stronger signature when chasing a target from behind
+  // (engine plume) and a weaker signature when approaching head-on.
+  //
+  // This model biases the effective heat signature based on the cosine between the
+  // target's velocity direction and the missile-to-target line of sight:
+  //   aspectCos = dot(norm(targetVel), norm(toTarget))
+  //   aspectCos = +1  => tail-chase (rear aspect)   => heatAspectRearFactor
+  //   aspectCos = -1  => head-on     (front aspect) => heatAspectFrontFactor
+  //
+  // The effect is blended in based on the target speed:
+  //   - below heatAspectMinSpeedKmS: factor = 1 (disabled)
+  //   - at/above heatAspectSpeedForFullKmS: full front/rear scaling applies
+  //
+  // Defaults preserve historical behavior (no aspect weighting) unless configured
+  // by the weapon tuning layer.
+  double heatAspectFrontFactor{1.0};
+  double heatAspectRearFactor{1.0};
+  double heatAspectMinSpeedKmS{0.02};
+  double heatAspectSpeedForFullKmS{0.20};
 
   // Optional: line-of-sight requirement for seeker tracking.
   //
@@ -384,6 +471,51 @@ struct Missile {
   // Optional bias used during autonomous reacquisition: when > 0, targets that are
   // actively jamming are easier to reacquire.
   double homeOnJamAcquireBias{0.0};
+
+  // -------------------------------------------------------------------------
+  // Optional: distance-aware radar jamming reception (deterministic)
+  // -------------------------------------------------------------------------
+  //
+  // Many seeker/jammer interactions depend on the *received* jamming power rather
+  // than the target's raw emission. When radarJammingHalfRangeKm > 0, the missile
+  // converts SphereTarget::jammerPower into a received jamming level jamming01 in
+  // [0,1] using an inverse-square law:
+  //
+  //   snr = jammerPower * (halfRange / max(dist, radarJammingMinDistKm))^2
+  //   jamming01 = snr / (1 + snr)
+  //
+  // This received value can optionally:
+  //   - gate HOJ activation via homeOnJamMinJamming01
+  //   - suppress radar seeker track quality via radarJammingTrackSuppressionGain
+  //
+  // Defaults preserve legacy behavior (no distance scaling).
+  double radarJammingHalfRangeKm{0.0};
+  double radarJammingMinDistKm{1.0};
+
+  // Optional additional HOJ threshold on received jamming level (0..1).
+  // When > 0, HOJ activates only if jamming01 >= this value.
+  double homeOnJamMinJamming01{0.0};
+
+  // Optional track-quality suppression gain under jamming.
+  // When > 0 and enableTrackQuality is enabled, direct radar track measurement
+  // quality is multiplied by:
+  //   1 / (1 + radarJammingTrackSuppressionGain * jamming01)
+  double radarJammingTrackSuppressionGain{0.0};
+
+  // Optional track-quality suppression under countermeasure clutter (deterministic).
+  //
+  // Countermeasures can reduce seeker measurement quality even without fully
+  // stealing the lock. When this gain is > 0 and enableTrackQuality is enabled,
+  // direct seeker measurement quality is multiplied by:
+  //
+  //   1 / (1 + decoyClutterTrackSuppressionGain * clutter)
+  //
+  // where `clutter` is a dimensionless ratio of the strongest in-FOV decoy score
+  // (computed with the same geometric scoring used for decoy attraction) to the
+  // current target score.
+  //
+  // 0 disables (legacy behavior).
+  double decoyClutterTrackSuppressionGain{0.0};
 
   // Optional decoy discrimination gates (seeker-active only).
   //
@@ -481,6 +613,36 @@ struct Missile {
   // bias is limited to a fraction of the missile's per-step turn capability.
   double swarmMaxSteerRad{0.0};
 
+  // -------------------------------------------------------------------------
+  // Optional: terminal weave / endgame evasive steering (deterministic)
+  // -------------------------------------------------------------------------
+  //
+  // Some missiles perform a small lateral weave in the terminal phase to
+  // complicate point defense. This applies a rotating angular offset to the
+  // commanded guidance direction.
+  //
+  // Enabled when:
+  //   terminalWeaveAmplitudeRad > 0 and terminalWeaveFrequencyHz > 0
+  // and only while the active seeker is enabled (after seekerActivationSimSec).
+  //
+  // The weave ramps up as the estimated time-to-impact (range/speed) falls below
+  // terminalWeaveStartTtiSec.
+  //
+  // Defaults disable the feature.
+  double terminalWeaveAmplitudeRad{0.0};
+  double terminalWeaveFrequencyHz{0.0};
+
+  // Start weaving when estimated time-to-impact is <= this value (seconds).
+  // If <= 0, weave is applied immediately once the seeker is active.
+  double terminalWeaveStartTtiSec{0.0};
+
+  // Optional hard clamp on the effective weave angle (rad). 0 disables.
+  double terminalWeaveMaxRad{0.0};
+
+  // Internal: deterministic weave phase offset (rad).
+  bool hasTerminalWeavePhase{false};
+  double terminalWeavePhaseRad{0.0};
+
 
 
   // Optional: decoy commitment duration (sim seconds).
@@ -510,11 +672,19 @@ struct Missile {
   bool hasLastKnownTarget{false};
   math::Vec3d lastKnownTargetPosKm{0, 0, 0};
   math::Vec3d lastKnownTargetVelKmS{0, 0, 0};
+  // Optional: last known target acceleration estimate (km/s^2).
+  // Used to improve inertial memory prediction and acceleration-aware lead.
+  math::Vec3d lastKnownTargetAccelKmS2{0, 0, 0};
   // Last observed thermal signature of the locked target.
   //
   // This is not serialized/persisted; it only exists to keep heat-seeker
   // scoring stable while guiding on target memory.
   double lastKnownTargetHeatSignature{1.0};
+  // Last observed radar signature of the locked target.
+  //
+  // This is not serialized/persisted; it only exists to keep radar seeker
+  // scoring stable while guiding on target memory.
+  double lastKnownTargetRadarSignature{1.0};
   double lastKnownTargetAgeSimSec{0.0};
 
   // Internal: missile age (sim seconds). Used for seeker activation timing.
@@ -539,6 +709,45 @@ struct Missile {
   double trackQualityFallHalfLifeSimSec{0.25};
   // Minimum fraction of decoyResistance when trackQuality==0. Clamped to [0,1].
   double trackQualityResistFloor{0.25};
+
+  // Optional: seeker signal-to-noise range falloff (deterministic).
+  //
+  // When seekerSignalHalfRangeKm > 0, direct seeker measurement quality is
+  // multiplied by a simple received-signal model in [0,1]:
+  //
+  //   snr = signalStrength * (halfRange / max(dist, seekerSignalMinDistKm))^2
+  //   signal01 = snr / (1 + snr)
+  //
+  // where signalStrength is derived from the locked target's heatSignature or
+  // radarSignature (including IR aspect weighting for heat seekers).
+  //
+  // This intentionally lightweight model makes:
+  //   - long-range tracks noisier (trackQuality drops)
+  //   - low-signature / stealthy targets harder to hold
+  // without adding nondeterministic randomness.
+  //
+  // 0 disables the feature (legacy behavior: no range falloff).
+  double seekerSignalHalfRangeKm{0.0};
+  // Minimum distance clamp used by the received-signal model (km). Prevents
+  // singularities at extremely close range.
+  double seekerSignalMinDistKm{1.0};
+
+
+
+  // Optional: deterministic track / measurement angular error (sensor noise).
+  //
+  // When enabled (trackErrorMaxRad > 0 and trackErrorFrequencyHz > 0) and the active seeker
+  // is running, the missile applies a small angular bias to its commanded guidance direction.
+  //
+  // The bias magnitude scales with (1 - trackQuality) when track quality is enabled,
+  // allowing jamming, notch, and high-LOS-rate situations to produce real miss distance even
+  // without decoys. Defaults disable the feature.
+  double trackErrorMaxRad{0.0};
+  double trackErrorFrequencyHz{0.0};
+
+  // Internal: deterministic track-error phase offset (rad). Not serialized/persisted.
+  bool hasTrackErrorPhase{false};
+  double trackErrorPhaseRad{0.0};
 
 
   // Optional: augmented proportional navigation (APN) target acceleration feed-forward.
@@ -585,6 +794,13 @@ struct MissileDetonation {
   double baseDmg{0.0};
   bool fromPlayer{false};
   core::u64 shooterId{0};
+
+  // Optional: set when the missile was destroyed by a ballistic projectile
+  // interception (e.g. point defense). The base explosion damage is still
+  // attributed to the missile's shooterId; this metadata is only for scoring/VFX.
+  bool intercepted{false};
+  core::u64 interceptorShooterId{0};
+  bool interceptorFromPlayer{false};
 };
 
 struct MissileHit {
@@ -630,6 +846,21 @@ void stepMissiles(std::vector<Missile>& missiles,
                   std::size_t targetCount,
                   std::vector<MissileDetonation>& outDetonations,
                   std::vector<MissileHit>& outHits);
+
+
+// Like stepMissiles(), but also allows ballistic projectiles to intercept missiles
+// during the step (useful for point defense).
+//
+// Contract: projectiles should have been stepped for the same dtSim immediately
+// before calling this function, so each projectile's [prevKm -> posKm] segment
+// corresponds to this frame. Intercepting projectiles are consumed (ttlSimSec=0).
+void stepMissilesWithProjectileInterception(std::vector<Missile>& missiles,
+                                            std::vector<Projectile>& projectiles,
+                                            double dtSim,
+                                            const SphereTarget* targets,
+                                            std::size_t targetCount,
+                                            std::vector<MissileDetonation>& outDetonations,
+                                            std::vector<MissileHit>& outHits);
 
 // Weapon firing output. This does not apply damage; it only emits the geometry
 // and hit metadata required for gameplay code to resolve the effect.

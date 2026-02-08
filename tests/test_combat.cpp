@@ -624,7 +624,210 @@ int test_combat() {
     }
   }
 
-  // --- HOJ should allow radar seekers to ignore doppler notch against jamming targets ---
+
+  // --- Radar signature weighting (big contacts resist chaff more than small) ---
+  {
+    sim::SphereTarget shipT{};
+    shipT.kind = sim::CombatTargetKind::Ship;
+    shipT.index = 0;
+    shipT.id = 2;
+    shipT.centerKm = {0, 0, 200};
+    shipT.velKmS = {0, 0, 0};
+    shipT.radiusKm = 1.0;
+    shipT.radarSignature = 50.0;
+
+    // A chaff-like decoy at a similar range but offset in X so guidance is distinguishable.
+    sim::SphereTarget decoyT{};
+    decoyT.kind = sim::CombatTargetKind::Decoy;
+    decoyT.index = 1;
+    decoyT.id = 200;
+    decoyT.centerKm = {50, 0, 200};
+    decoyT.velKmS = {0, 0, 0};
+    decoyT.radiusKm = 1.0;
+    decoyT.decoyHeat = 0.0;
+    decoyT.decoyRadar = 15.0;
+
+    sim::SphereTarget targets[2]{shipT, decoyT};
+
+    auto makeMissile = [&]() {
+      sim::Missile m{};
+      m.prevKm = {0, 0, 0};
+      m.posKm = {0, 0, 0};
+      m.velKmS = {0, 0, 10};
+      m.ttlSimSec = 30.0;
+      m.radiusKm = 0.1;
+      m.dmg = 0.0;
+      m.blastRadiusKm = 0.0;
+      m.turnRateRadS = 100.0;
+
+      m.hasTarget = true;
+      m.targetKind = sim::CombatTargetKind::Ship;
+      m.targetId = 2;
+
+      m.seeker = sim::MissileSeekerType::Radar;
+      m.seekerActivationSimSec = 0.0;
+      m.seekerFovCos = 0.0;
+      m.decoyResistance = 1.0;
+      m.decoyCommitSimSec = 0.0;
+      return m;
+    };
+
+    // Case A: strong radar signature should resist the decoy.
+    {
+      std::vector<sim::Missile> ms;
+      ms.push_back(makeMissile());
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, targets, 2, dets, hits);
+
+      if (ms.empty()) {
+        std::cerr << "[test_combat] radarSignature test (A): missile unexpectedly destroyed.\n";
+        ++fails;
+      } else {
+        const auto d = ms[0].velKmS.normalized();
+        const auto toDecoy = (targets[1].centerKm - ms[0].posKm).normalized();
+        const double dot = d.x * toDecoy.x + d.y * toDecoy.y + d.z * toDecoy.z;
+        if (dot > 0.985) {
+          std::cerr << "[test_combat] radarSignature test (A): expected strong target to beat decoy. dot="
+                    << dot << "\n";
+          ++fails;
+        }
+      }
+    }
+
+    // Case B: weak radar signature should be overridden by the same decoy.
+    targets[0].radarSignature = 10.0;
+    {
+      std::vector<sim::Missile> ms;
+      ms.push_back(makeMissile());
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, targets, 2, dets, hits);
+
+      if (ms.empty()) {
+        std::cerr << "[test_combat] radarSignature test (B): missile unexpectedly destroyed.\n";
+        ++fails;
+      } else {
+        const auto d = ms[0].velKmS.normalized();
+        const auto toDecoy = (targets[1].centerKm - ms[0].posKm).normalized();
+        const double dot = d.x * toDecoy.x + d.y * toDecoy.y + d.z * toDecoy.z;
+        if (dot < 0.99) {
+          std::cerr << "[test_combat] radarSignature test (B): expected decoy override for weak target. dot="
+                    << dot << "\n";
+          ++fails;
+        }
+      }
+    }
+  }
+
+  
+  // --- Heat seeker aspect weighting (tail-on hotter than head-on) ---
+  {
+    sim::SphereTarget shipT{};
+    shipT.kind = sim::CombatTargetKind::Ship;
+    shipT.index = 0;
+    shipT.id = 1;
+    shipT.centerKm = {0, 0, 200};
+    shipT.velKmS = {0, 0, 0};
+    shipT.radiusKm = 1.0;
+    shipT.heatSignature = 15.0;
+
+    // A flare-like decoy at a similar range but offset in X so guidance is distinguishable.
+    sim::SphereTarget decoyT{};
+    decoyT.kind = sim::CombatTargetKind::Decoy;
+    decoyT.index = 1;
+    decoyT.id = 100;
+    decoyT.centerKm = {50, 0, 200};
+    decoyT.velKmS = {0, 0, 0};
+    decoyT.radiusKm = 1.0;
+    decoyT.decoyHeat = 15.0;
+    decoyT.decoyRadar = 0.0;
+
+    sim::SphereTarget targets[2]{shipT, decoyT};
+
+    auto makeMissile = [&]() {
+      sim::Missile m{};
+      m.prevKm = {0, 0, 0};
+      m.posKm = {0, 0, 0};
+      m.velKmS = {0, 0, 10};
+      m.ttlSimSec = 30.0;
+      m.radiusKm = 0.1;
+      m.dmg = 0.0;
+      m.blastRadiusKm = 0.0;
+      m.turnRateRadS = 50.0;
+
+      m.hasTarget = true;
+      m.targetKind = sim::CombatTargetKind::Ship;
+      m.targetId = 1;
+
+      m.seeker = sim::MissileSeekerType::Heat;
+      m.seekerActivationSimSec = 0.0;
+      m.seekerFovCos = 0.0;
+      m.decoyResistance = 1.0;
+
+      // Force strong aspect sensitivity for the test.
+      m.heatAspectFrontFactor = 0.55;
+      m.heatAspectRearFactor = 1.45;
+      m.heatAspectMinSpeedKmS = 0.0;
+      m.heatAspectSpeedForFullKmS = 0.01;
+
+      return m;
+    };
+
+    // Case A: tail chase (target moving away) should resist the decoy.
+    targets[0].velKmS = {0, 0, 0.25};
+    {
+      std::vector<sim::Missile> ms;
+      ms.push_back(makeMissile());
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, targets, 2, dets, hits);
+
+      if (ms.empty()) {
+        std::cerr << "[test_combat] heatAspect test (A): missile unexpectedly destroyed.\n";
+        ++fails;
+      } else {
+        const auto d = ms[0].velKmS.normalized();
+        const auto toDecoy = (targets[1].centerKm - ms[0].posKm).normalized();
+        const double dot = d.x * toDecoy.x + d.y * toDecoy.y + d.z * toDecoy.z;
+        if (dot > 0.985) {
+          std::cerr << "[test_combat] heatAspect test (A): expected tail-on ship to beat decoy. dot="
+                    << dot << "\n";
+          ++fails;
+        }
+      }
+    }
+
+    // Case B: head-on (target closing) should be easier to decoy.
+    targets[0].velKmS = {0, 0, -0.25};
+    {
+      std::vector<sim::Missile> ms;
+      ms.push_back(makeMissile());
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, targets, 2, dets, hits);
+
+      if (ms.empty()) {
+        std::cerr << "[test_combat] heatAspect test (B): missile unexpectedly destroyed.\n";
+        ++fails;
+      } else {
+        const auto d = ms[0].velKmS.normalized();
+        const auto toDecoy = (targets[1].centerKm - ms[0].posKm).normalized();
+        const double dot = d.x * toDecoy.x + d.y * toDecoy.y + d.z * toDecoy.z;
+        if (dot < 0.99) {
+          std::cerr << "[test_combat] heatAspect test (B): expected decoy override head-on. dot="
+                    << dot << "\n";
+          ++fails;
+        }
+      }
+    }
+  }
+
+// --- HOJ should allow radar seekers to ignore doppler notch against jamming targets ---
   {
     sim::SphereTarget tgt{};
     tgt.kind = sim::CombatTargetKind::Ship;
@@ -707,6 +910,97 @@ int test_combat() {
         if (d.x < 0.25) {
           std::cerr << "[test_combat] HOJ test (enabled): missile did not turn toward jammer. dir=(" << d.x << "," << d.y
                     << "," << d.z << ")\n";
+          ++fails;
+        }
+      }
+    }
+  }
+
+
+  // --- HOJ received-jamming gating: far target should not bypass notch unless jamming is strong enough ---
+  {
+    sim::SphereTarget tgt{};
+    tgt.kind = sim::CombatTargetKind::Ship;
+    tgt.index = 0;
+    tgt.id = 9100;
+    tgt.centerKm = {300, 0, 0};
+    tgt.velKmS = {0, 0, 0};
+    tgt.radiusKm = 1.0;
+    tgt.jammerPower = 1.0;
+
+    auto makeMissile = [&]() {
+      sim::Missile m{};
+      m.prevKm = {0, 0, 0};
+      m.posKm = {0, 0, 0};
+      m.velKmS = {0, 0, 10};
+      m.ttlSimSec = 30.0;
+      m.radiusKm = 0.1;
+      m.dmg = 0.0;
+      m.blastRadiusKm = 0.0;
+      m.turnRateRadS = 20.0;
+
+      m.hasTarget = true;
+      m.targetKind = sim::CombatTargetKind::Ship;
+      m.targetId = 9100;
+
+      m.seeker = sim::MissileSeekerType::Radar;
+      m.seekerActivationSimSec = 0.0;
+      m.seekerFovCos = -1.0;
+
+      m.radarDopplerNotchKmS = 5.0;
+
+      m.guidance = sim::MissileGuidance::LeadPursuit;
+
+      m.homeOnJam = true;
+      m.homeOnJamMinJammerPower = 0.25;
+      // Require a minimum received jamming level, with distance-aware scaling.
+      m.radarJammingHalfRangeKm = 100.0;
+      m.radarJammingMinDistKm = 1.0;
+      m.homeOnJamMinJamming01 = 0.20;
+
+      return m;
+    };
+
+    // Case A: far range -> received jamming is weak -> HOJ should NOT bypass the notch.
+    {
+      std::vector<sim::Missile> ms;
+      ms.push_back(makeMissile());
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, &tgt, 1, dets, hits);
+
+      if (ms.empty()) {
+        std::cerr << "[test_combat] HOJ jamming01 test (far): missile unexpectedly destroyed.\n";
+        ++fails;
+      } else {
+        const auto d = ms[0].velKmS.normalized();
+        if (std::fabs(d.x) > 0.02 || d.z < 0.98) {
+          std::cerr << "[test_combat] HOJ jamming01 test (far): missile turned despite weak received jamming. dir=(" << d.x
+                    << "," << d.y << "," << d.z << ")\n";
+          ++fails;
+        }
+      }
+    }
+
+    // Case B: closer range -> received jamming is stronger -> HOJ should bypass the notch and turn.
+    tgt.centerKm = {100, 0, 0};
+    {
+      std::vector<sim::Missile> ms;
+      ms.push_back(makeMissile());
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, &tgt, 1, dets, hits);
+
+      if (ms.empty()) {
+        std::cerr << "[test_combat] HOJ jamming01 test (near): missile unexpectedly destroyed.\n";
+        ++fails;
+      } else {
+        const auto d = ms[0].velKmS.normalized();
+        if (d.x < 0.25) {
+          std::cerr << "[test_combat] HOJ jamming01 test (near): missile did not turn with strong received jamming. dir=(" << d.x
+                    << "," << d.y << "," << d.z << ")\n";
           ++fails;
         }
       }
@@ -839,6 +1133,77 @@ int test_combat() {
       }
     }
   }
+
+
+  // --- Lead pursuit should account for target acceleration when provided ---
+  {
+    sim::SphereTarget tgt{};
+    tgt.kind = sim::CombatTargetKind::Ship;
+    tgt.index = 0;
+    tgt.id = 1234;
+    tgt.centerKm = {0, 0, 100};
+    tgt.velKmS = {0, 0, 0};
+    tgt.accelKmS2 = {1.0, 0, 0}; // constant lateral accel (km/s^2)
+    tgt.radiusKm = 1.0;
+
+    auto makeMissile = []() {
+      sim::Missile m{};
+      m.prevKm = {0, 0, 0};
+      m.posKm = {0, 0, 0};
+      m.velKmS = {0, 0, 10};
+      m.ttlSimSec = 60.0;
+      m.radiusKm = 0.1;
+      m.dmg = 0.0;
+      m.blastRadiusKm = 0.0;
+
+      // High turn authority so the first step reflects the computed lead direction.
+      m.turnRateRadS = 1000.0;
+      m.maxTurnAccelRadS2 = 0.0; // disable lag for deterministic snapping in this test
+
+      m.hasTarget = true;
+      m.targetKind = sim::CombatTargetKind::Ship;
+      m.targetId = 1234;
+
+      // Ensure the seeker does not block tracking.
+      m.seeker = sim::MissileSeekerType::Radar;
+      m.seekerActivationSimSec = 0.0;
+      m.seekerFovCos = -1.0;
+      m.requireLineOfSight = false;
+
+      m.guidance = sim::MissileGuidance::LeadPursuit;
+      return m;
+    };
+
+    auto runX = [&](const sim::SphereTarget& t) {
+      std::vector<sim::Missile> ms;
+      ms.push_back(makeMissile());
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, &t, 1, dets, hits);
+
+      if (ms.empty()) return 0.0;
+      return ms[0].velKmS.normalized().x;
+    };
+
+    // Case A: with zero target acceleration, lead pursuit should aim essentially straight.
+    sim::SphereTarget noA = tgt;
+    noA.accelKmS2 = {0, 0, 0};
+    const double xNoA = runX(noA);
+
+    // Case B: with strong lateral acceleration, the lead point should shift in +X.
+    const double xA = runX(tgt);
+
+    if (std::fabs(xNoA) > 0.05) {
+      std::cerr << "[test_combat] accel lead test: expected near-zero x without accel. xNoA=" << xNoA << "\n";
+      ++fails;
+    }
+    if (!(xA > 0.55)) {
+      std::cerr << "[test_combat] accel lead test: expected strong +X lead with accel. xA=" << xA << "\n";
+      ++fails;
+    }
+  }
+
 
   // --- Decoy commitment should hold guidance for a minimum time window ---
   {
@@ -1026,6 +1391,90 @@ int test_combat() {
       std::cerr << "[test_combat] track quality test: expected decoy commit after lock break. committedId="
                 << ms[0].committedDecoyId << "\n";
       ++fails;
+    }
+  }
+
+
+
+  // --- Track quality: noise jamming can degrade radar measurement quality (optional) ---
+  {
+    sim::SphereTarget shipT{};
+    shipT.kind = sim::CombatTargetKind::Ship;
+    shipT.index = 0;
+    shipT.id = 510;
+    shipT.centerKm = {0, 0, 200};
+    shipT.velKmS = {0, 0, 0};
+    shipT.radiusKm = 1.0;
+    shipT.jammerPower = 1.0;
+
+    std::vector<sim::MissileDetonation> dets;
+    std::vector<sim::MissileHit> hits;
+
+    auto makeMissile = [&]() {
+      sim::Missile m{};
+      m.prevKm = {0, 0, 0};
+      m.posKm = {0, 0, 0};
+      m.velKmS = {0, 0, 10};
+      m.ttlSimSec = 30.0;
+      m.radiusKm = 0.1;
+      m.dmg = 0.0;
+      m.blastRadiusKm = 0.0;
+      m.turnRateRadS = 1.0e9; // ensure heading snaps to the guide direction
+
+      m.hasTarget = true;
+      m.targetKind = sim::CombatTargetKind::Ship;
+      m.targetId = 510;
+
+      m.seeker = sim::MissileSeekerType::Radar;
+      m.seekerActivationSimSec = 0.0;
+      m.seekerFovCos = -1.0;
+      m.decoyResistance = 1.0e9;
+
+      m.enableTrackQuality = true;
+      m.trackQuality = 1.0;
+      m.trackQualityRiseHalfLifeSimSec = 0.10;
+      m.trackQualityFallHalfLifeSimSec = 0.25;
+      m.trackQualityResistFloor = 1.0;
+
+      return m;
+    };
+
+    // Control: no suppression gain -> track quality remains ~1 while directly tracking.
+    {
+      std::vector<sim::Missile> ms;
+      auto m = makeMissile();
+      m.radarJammingTrackSuppressionGain = 0.0;
+      ms.push_back(m);
+
+      sim::stepMissiles(ms, 0.5, &shipT, 1, dets, hits);
+      if (ms.empty()) {
+        std::cerr << "[test_combat] jamming track quality test (control): missile destroyed unexpectedly.\n";
+        ++fails;
+      } else if (ms[0].trackQuality < 0.95) {
+        std::cerr << "[test_combat] jamming track quality test (control): expected ~no degradation. q=" << ms[0].trackQuality
+                  << "\n";
+        ++fails;
+      }
+    }
+
+    // With suppression gain + distance scaling: track quality should degrade below 1.
+    {
+      std::vector<sim::Missile> ms;
+      auto m = makeMissile();
+      m.radarJammingHalfRangeKm = 200.0; // at 200 km -> jamming01 ~0.5
+      m.radarJammingMinDistKm = 1.0;
+      m.radarJammingTrackSuppressionGain = 2.0;
+      ms.push_back(m);
+
+      sim::stepMissiles(ms, 0.5, &shipT, 1, dets, hits);
+      if (ms.empty()) {
+        std::cerr << "[test_combat] jamming track quality test (suppressed): missile destroyed unexpectedly.\n";
+        ++fails;
+      } else if (ms[0].trackQuality > 0.90) {
+        std::cerr << "[test_combat] jamming track quality test (suppressed): expected degradation under jamming. q="
+                  << ms[0].trackQuality << "\n";
+        ++fails;
+      }
     }
   }
 
@@ -1387,6 +1836,115 @@ int test_combat() {
   }
 
 
+
+
+  // --- Seeker update period: decoy/reacquire decisions should only update on scan ticks ---
+  {
+    sim::SphereTarget shipT{};
+    shipT.kind = sim::CombatTargetKind::Ship;
+    shipT.index = 0;
+    shipT.id = 10;
+    shipT.centerKm = {0, 0, 200};
+    shipT.velKmS = {0, 0, 0};
+    shipT.radiusKm = 1.0;
+    shipT.heatSignature = 1.0;
+
+    sim::SphereTarget decoyT{};
+    decoyT.kind = sim::CombatTargetKind::Decoy;
+    decoyT.index = 1;
+    decoyT.id = 30000;
+    decoyT.centerKm = {50, 0, 200};
+    decoyT.velKmS = {0, 0, 0};
+    decoyT.radiusKm = 0.5;
+    decoyT.decoyHeat = 250.0; // very strong flare-like signal
+
+    sim::SphereTarget targetsNoDecoy[1]{shipT};
+    sim::SphereTarget targetsWithDecoy[2]{shipT, decoyT};
+
+    std::vector<sim::Missile> ms;
+
+    auto makeMissile = [&](double updatePeriodSec) {
+      sim::Missile m{};
+      m.prevKm = {0, 0, 0};
+      m.posKm = {0, 0, 0};
+      m.velKmS = {0, 0, 10};
+      m.ttlSimSec = 30.0;
+      m.radiusKm = 0.1;
+      m.dmg = 0.0;
+      m.blastRadiusKm = 0.0;
+      m.proximityFuseKm = 0.0;
+      m.turnRateRadS = 100.0;
+
+      m.hasTarget = true;
+      m.targetKind = sim::CombatTargetKind::Ship;
+      m.targetId = 10;
+
+      m.seeker = sim::MissileSeekerType::Heat;
+      m.seekerFovCos = -1.0; // wide cone
+      m.seekerActivationSimSec = 0.0;
+
+      m.decoyResistance = 1.0;
+      m.decoyCommitSimSec = 5.0;
+      m.targetMemorySimSec = 5.0;
+
+      // Feature under test:
+      //  - 0.0 => continuous (legacy)
+      //  - >0  => scan ticks
+      m.seekerUpdatePeriodSimSec = updatePeriodSec;
+      return m;
+    };
+
+    // Missile A: continuous updates (legacy).
+    ms.push_back(makeMissile(0.0));
+    // Missile B: 1 Hz seeker update (rate-limited).
+    ms.push_back(makeMissile(1.0));
+
+    std::vector<sim::MissileDetonation> dets;
+    std::vector<sim::MissileHit> hits;
+
+    // Step 1: establish baseline memory on the ship target (no decoy present yet).
+    sim::stepMissiles(ms, 0.1, targetsNoDecoy, 1, dets, hits);
+    if (ms.size() < 2) {
+      std::cerr << "[test_combat] seeker update period test: missiles destroyed unexpectedly in step 1.\n";
+      ++fails;
+    }
+
+    // Step 2: the decoy appears.
+    sim::stepMissiles(ms, 0.1, targetsWithDecoy, 2, dets, hits);
+    if (ms.size() < 2) {
+      std::cerr << "[test_combat] seeker update period test: missiles destroyed unexpectedly in step 2.\n";
+      ++fails;
+    } else {
+      // Continuous-update missile should commit immediately.
+      if (ms[0].committedDecoyId != decoyT.id) {
+        std::cerr << "[test_combat] seeker update period test: expected immediate decoy commit for continuous seeker. committedId="
+                  << ms[0].committedDecoyId << "\n";
+        ++fails;
+      }
+      // Rate-limited seeker should NOT commit until its next scan tick.
+      if (ms[1].committedDecoyId != 0) {
+        std::cerr << "[test_combat] seeker update period test: expected no early commit for rate-limited seeker. committedId="
+                  << ms[1].committedDecoyId << "\n";
+        ++fails;
+      }
+    }
+
+    // Advance until the rate-limited missile gets a scan tick (period=1.0s).
+    for (int i = 0; i < 30 && ms.size() >= 2; ++i) {
+      sim::stepMissiles(ms, 0.1, targetsWithDecoy, 2, dets, hits);
+      if (ms[1].committedDecoyId == decoyT.id) break;
+    }
+
+    if (ms.size() < 2) {
+      std::cerr << "[test_combat] seeker update period test: missiles destroyed unexpectedly while advancing time.\n";
+      ++fails;
+    } else if (ms[1].committedDecoyId != decoyT.id) {
+      std::cerr << "[test_combat] seeker update period test: expected decoy commit on later scan tick. committedId="
+                << ms[1].committedDecoyId << "\n";
+      ++fails;
+    }
+  }
+
   // --- Midcourse datalink gating: optional LOS/range should control pre-activation target updates ---
   {
     // Shooter platform (launching ship).
@@ -1652,6 +2210,83 @@ int test_combat() {
     if (std::fabs(xClose) > 0.05) {
       std::cerr << "[test_combat] burn-through test: expected close-range decoy rejection. xClose=" << xClose
                 << "\n";
+      ++fails;
+    }
+  }
+
+
+  // --- Seeker slew: large-angle decoy pulls should be suppressed when the seeker can't re-point quickly ---
+  {
+    auto runCase = [&](double slewRateRadS) {
+      sim::SphereTarget shipT{};
+      shipT.kind = sim::CombatTargetKind::Ship;
+      shipT.index = 0;
+      shipT.id = 1;
+      shipT.centerKm = {0, 0, 100};
+      shipT.velKmS = {0, 0, 0};
+      shipT.radiusKm = 1.0;
+
+      // Decoy placed at the same range but 30 degrees off-boresight.
+      const double rangeKm = 100.0;
+      const double angRad = 0.5235987755982988; // 30 deg
+      const double x = rangeKm * std::sin(angRad);
+      const double z = rangeKm * std::cos(angRad);
+
+      sim::SphereTarget decoyT{};
+      decoyT.kind = sim::CombatTargetKind::Decoy;
+      decoyT.index = 1;
+      decoyT.id = 2;
+      decoyT.centerKm = {x, 0, z};
+      decoyT.velKmS = {0, 0, 0};
+      decoyT.radiusKm = 0.5;
+      decoyT.decoyHeat = 0.0;
+      decoyT.decoyRadar = 1.2; // slightly stronger than the true target (when slew is ignored)
+
+      sim::SphereTarget targets[2]{shipT, decoyT};
+
+      std::vector<sim::Missile> ms;
+      sim::Missile m{};
+      m.prevKm = {0, 0, 0};
+      m.posKm = {0, 0, 0};
+      m.velKmS = {0, 0, 10};
+      m.ttlSimSec = 30.0;
+      m.radiusKm = 0.1;
+      m.turnRateRadS = 100.0; // snap for deterministic steering
+
+      m.hasTarget = true;
+      m.targetKind = sim::CombatTargetKind::Ship;
+      m.targetId = 1;
+
+      m.seeker = sim::MissileSeekerType::Radar;
+      m.seekerActivationSimSec = 0.0;
+      m.seekerFovCos = -1.0;
+      m.decoyResistance = 1.0;
+
+      // This is the key: limit how fast the seeker can swing to a new direction.
+      m.seekerSlewRateRadS = slewRateRadS;
+      m.enableTrackQuality = false;
+
+      ms.push_back(m);
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, targets, 2, dets, hits);
+
+      if (ms.empty()) return 0.0;
+      return ms[0].velKmS.normalized().x;
+    };
+
+    const double xFast = runCase(0.0);
+    const double xSlow = runCase(0.5);
+
+    if (!(xFast > 0.20)) {
+      std::cerr << "[test_combat] seeker slew decoy test: expected decoy pull when slew is unlimited. xFast=" << xFast
+                << "\n";
+      ++fails;
+    }
+    if (std::fabs(xSlow) > 0.05) {
+      std::cerr << "[test_combat] seeker slew decoy test: expected lock to resist large-angle decoy when slew is slow. xSlow="
+                << xSlow << "\n";
       ++fails;
     }
   }
