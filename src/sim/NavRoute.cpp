@@ -1346,6 +1346,241 @@ std::vector<SystemId> plotRouteAStarCostHazards(const std::vector<SystemStub>& n
 }
 
 
+
+std::vector<SystemId> plotRouteAStarCostConstrained(const std::vector<SystemStub>& nodes,
+                                                   SystemId startId,
+                                                   SystemId goalId,
+                                                   double maxJumpLy,
+                                                   double costPerJump,
+                                                   double costPerLy,
+                                                   std::span<const SystemId> bannedNodes,
+                                                   std::span<const RouteEdge> bannedEdges,
+                                                   RoutePlanStats* outStats,
+                                                   std::size_t maxExpansions) {
+  RoutePlanStats stats{};
+
+  if (nodes.empty() || startId == 0 || goalId == 0) {
+    setStats(outStats, stats);
+    return {};
+  }
+  if (maxJumpLy <= 0.0 || maxExpansions == 0) {
+    setStats(outStats, stats);
+    return {};
+  }
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+
+  // Degenerate: treat as hop-minimizing (while still respecting constraints).
+  if (costPerJump <= 0.0 && costPerLy <= 0.0) {
+    costPerJump = 1.0;
+    costPerLy = 0.0;
+  }
+
+  const auto idx = buildIndex(nodes);
+  if (idx.find(startId) == idx.end() || idx.find(goalId) == idx.end()) {
+    setStats(outStats, stats);
+    return {};
+  }
+
+  const auto grid = buildGrid(nodes, maxJumpLy);
+
+  std::unordered_set<SystemId> bannedNodeSet;
+  std::unordered_set<Edge, EdgeHash> bannedEdgeSet;
+
+  const std::unordered_set<SystemId>* bannedNodePtr = nullptr;
+  const std::unordered_set<Edge, EdgeHash>* bannedEdgePtr = nullptr;
+
+  if (!bannedNodes.empty()) {
+    bannedNodeSet.reserve(bannedNodes.size());
+    for (const SystemId id : bannedNodes) {
+      if (id != 0) bannedNodeSet.insert(id);
+    }
+    bannedNodePtr = &bannedNodeSet;
+  }
+
+  if (!bannedEdges.empty()) {
+    bannedEdgeSet.reserve(bannedEdges.size() * 2);
+    for (const RouteEdge e : bannedEdges) {
+      if (e.from == 0 || e.to == 0 || e.from == e.to) continue;
+      // Treat as undirected by inserting both directions.
+      bannedEdgeSet.insert(Edge{e.from, e.to});
+      bannedEdgeSet.insert(Edge{e.to, e.from});
+    }
+    bannedEdgePtr = &bannedEdgeSet;
+  }
+
+  const auto res = aStarCostSolve(nodes, idx, grid,
+                                 startId, goalId,
+                                 maxJumpLy,
+                                 costPerJump, costPerLy,
+                                 bannedNodePtr, bannedEdgePtr,
+                                 maxExpansions);
+
+  setStats(outStats, res.stats);
+  return res.path;
+}
+
+std::vector<SystemId> plotRouteAStarCostRiskConstrained(const std::vector<SystemStub>& nodes,
+                                                       SystemId startId,
+                                                       SystemId goalId,
+                                                       double maxJumpLy,
+                                                       double costPerJump,
+                                                       double costPerLy,
+                                                       double riskWeightPerLy,
+                                                       std::span<const double> risk01PerNode,
+                                                       std::span<const SystemId> bannedNodes,
+                                                       std::span<const RouteEdge> bannedEdges,
+                                                       RoutePlanStats* outStats,
+                                                       std::size_t maxExpansions) {
+  // If risk weighting is disabled, fall back to the plain constrained cost model.
+  if (riskWeightPerLy <= 0.0) {
+    return plotRouteAStarCostConstrained(nodes, startId, goalId, maxJumpLy,
+                                         costPerJump, costPerLy,
+                                         bannedNodes, bannedEdges,
+                                         outStats, maxExpansions);
+  }
+
+  RoutePlanStats stats{};
+
+  if (nodes.empty() || startId == 0 || goalId == 0) {
+    setStats(outStats, stats);
+    return {};
+  }
+  if (maxJumpLy <= 0.0 || maxExpansions == 0) {
+    setStats(outStats, stats);
+    return {};
+  }
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+  if (riskWeightPerLy < 0.0) riskWeightPerLy = 0.0;
+
+  const auto idx = buildIndex(nodes);
+  if (idx.find(startId) == idx.end() || idx.find(goalId) == idx.end()) {
+    setStats(outStats, stats);
+    return {};
+  }
+
+  const auto grid = buildGrid(nodes, maxJumpLy);
+
+  std::unordered_set<SystemId> bannedNodeSet;
+  std::unordered_set<Edge, EdgeHash> bannedEdgeSet;
+
+  const std::unordered_set<SystemId>* bannedNodePtr = nullptr;
+  const std::unordered_set<Edge, EdgeHash>* bannedEdgePtr = nullptr;
+
+  if (!bannedNodes.empty()) {
+    bannedNodeSet.reserve(bannedNodes.size());
+    for (const SystemId id : bannedNodes) {
+      if (id != 0) bannedNodeSet.insert(id);
+    }
+    bannedNodePtr = &bannedNodeSet;
+  }
+
+  if (!bannedEdges.empty()) {
+    bannedEdgeSet.reserve(bannedEdges.size() * 2);
+    for (const RouteEdge e : bannedEdges) {
+      if (e.from == 0 || e.to == 0 || e.from == e.to) continue;
+      bannedEdgeSet.insert(Edge{e.from, e.to});
+      bannedEdgeSet.insert(Edge{e.to, e.from});
+    }
+    bannedEdgePtr = &bannedEdgeSet;
+  }
+
+  const auto res = aStarCostSolveRisk(nodes, idx, grid,
+                                     startId, goalId,
+                                     maxJumpLy,
+                                     costPerJump, costPerLy, riskWeightPerLy,
+                                     risk01PerNode,
+                                     bannedNodePtr, bannedEdgePtr,
+                                     maxExpansions);
+
+  setStats(outStats, res.stats);
+  return res.path;
+}
+
+std::vector<SystemId> plotRouteAStarCostHazardsConstrained(const std::vector<SystemStub>& nodes,
+                                                          SystemId startId,
+                                                          SystemId goalId,
+                                                          double maxJumpLy,
+                                                          double costPerJump,
+                                                          double costPerLy,
+                                                          double hazardWeightPerLy,
+                                                          core::u64 universeSeed,
+                                                          double timeDays,
+                                                          std::span<const SystemId> bannedNodes,
+                                                          std::span<const RouteEdge> bannedEdges,
+                                                          RoutePlanStats* outStats,
+                                                          std::size_t maxExpansions) {
+  // If hazard weighting is disabled, fall back to the plain constrained cost model.
+  if (hazardWeightPerLy <= 0.0) {
+    return plotRouteAStarCostConstrained(nodes, startId, goalId, maxJumpLy,
+                                         costPerJump, costPerLy,
+                                         bannedNodes, bannedEdges,
+                                         outStats, maxExpansions);
+  }
+
+  RoutePlanStats stats{};
+
+  if (nodes.empty() || startId == 0 || goalId == 0) {
+    setStats(outStats, stats);
+    return {};
+  }
+  if (maxJumpLy <= 0.0 || maxExpansions == 0) {
+    setStats(outStats, stats);
+    return {};
+  }
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+  if (hazardWeightPerLy < 0.0) hazardWeightPerLy = 0.0;
+
+  const auto idx = buildIndex(nodes);
+  if (idx.find(startId) == idx.end() || idx.find(goalId) == idx.end()) {
+    setStats(outStats, stats);
+    return {};
+  }
+
+  const auto grid = buildGrid(nodes, maxJumpLy);
+
+  std::unordered_set<SystemId> bannedNodeSet;
+  std::unordered_set<Edge, EdgeHash> bannedEdgeSet;
+
+  const std::unordered_set<SystemId>* bannedNodePtr = nullptr;
+  const std::unordered_set<Edge, EdgeHash>* bannedEdgePtr = nullptr;
+
+  if (!bannedNodes.empty()) {
+    bannedNodeSet.reserve(bannedNodes.size());
+    for (const SystemId id : bannedNodes) {
+      if (id != 0) bannedNodeSet.insert(id);
+    }
+    bannedNodePtr = &bannedNodeSet;
+  }
+
+  if (!bannedEdges.empty()) {
+    bannedEdgeSet.reserve(bannedEdges.size() * 2);
+    for (const RouteEdge e : bannedEdges) {
+      if (e.from == 0 || e.to == 0 || e.from == e.to) continue;
+      bannedEdgeSet.insert(Edge{e.from, e.to});
+      bannedEdgeSet.insert(Edge{e.to, e.from});
+    }
+    bannedEdgePtr = &bannedEdgeSet;
+  }
+
+  const auto res = aStarCostSolveHazards(nodes, idx, grid,
+                                        startId, goalId,
+                                        maxJumpLy,
+                                        costPerJump, costPerLy, hazardWeightPerLy,
+                                        universeSeed, timeDays,
+                                        bannedNodePtr, bannedEdgePtr,
+                                        maxExpansions);
+
+  setStats(outStats, res.stats);
+  return res.path;
+}
+
+
 std::vector<KRoute> plotKRoutesAStarCost(const std::vector<SystemStub>& nodes,
                                         SystemId startId,
                                         SystemId goalId,
@@ -1794,6 +2029,159 @@ std::vector<KRoute> plotKRoutesAStarHops(const std::vector<SystemStub>& nodes,
                                         std::size_t k,
                                         std::size_t maxExpansionsPerSolve) {
   return plotKRoutesAStarCost(nodes, startId, goalId, maxJumpLy, 1.0, 0.0, k, maxExpansionsPerSolve);
+}
+
+std::vector<KRoute> selectDiversifiedKRoutesMMR(std::span<const KRoute> candidates,
+                                                std::size_t k,
+                                                double diversityWeight01,
+                                                bool ignoreEndpoints) {
+  std::vector<KRoute> out;
+  if (k == 0) return out;
+  if (candidates.empty()) return out;
+
+  double alpha = diversityWeight01;
+  if (!std::isfinite(alpha)) alpha = 0.0;
+  alpha = std::clamp(alpha, 0.0, 1.0);
+
+  // Deduplicate by path (keep the lowest-cost entry).
+  std::vector<KRoute> uniq;
+  uniq.reserve(candidates.size());
+
+  for (const KRoute& c : candidates) {
+    if (c.path.empty()) continue;
+
+    bool merged = false;
+    for (auto& u : uniq) {
+      if (u.path == c.path) {
+        // Prefer lower cost; if costs tie, prefer lexicographically smaller path.
+        const double du = u.cost;
+        const double dc = c.cost;
+        if ((dc < du - 1e-12) || (std::abs(dc - du) <= 1e-12 && pathLexLess(c.path, u.path))) {
+          u = c;
+        }
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      uniq.push_back(c);
+    }
+  }
+
+  if (uniq.empty()) return out;
+
+  // Stable total order: (cost, then path lex).
+  std::sort(uniq.begin(), uniq.end(), [&](const KRoute& a, const KRoute& b) {
+    const double da = a.cost;
+    const double db = b.cost;
+    if (std::abs(da - db) > 1e-12) return da < db;
+    return pathLexLess(a.path, b.path);
+  });
+
+  if (k > uniq.size()) k = uniq.size();
+  out.reserve(k);
+
+  // Compute cost normalization range.
+  double minCost = uniq.front().cost;
+  double maxCost = uniq.front().cost;
+  for (const auto& r : uniq) {
+    if (!std::isfinite(r.cost)) continue;
+    minCost = std::min(minCost, r.cost);
+    maxCost = std::max(maxCost, r.cost);
+  }
+  if (!std::isfinite(minCost)) minCost = 0.0;
+  if (!std::isfinite(maxCost)) maxCost = minCost;
+
+  const auto quality01 = [&](double cost) {
+    if (!std::isfinite(cost)) return 0.0;
+    if (maxCost <= minCost + 1e-12) return 1.0;
+    double t = (cost - minCost) / (maxCost - minCost);
+    t = std::clamp(t, 0.0, 1.0);
+    return 1.0 - t;
+  };
+
+  // Greedy MMR-like selection.
+  std::vector<bool> used(uniq.size(), false);
+
+  // Always take the best-cost route first.
+  out.push_back(uniq[0]);
+  used[0] = true;
+
+  for (std::size_t step = 1; step < k; ++step) {
+    std::size_t bestIdx = (std::size_t)-1;
+    double bestScore = -1e300;
+
+    for (std::size_t i = 0; i < uniq.size(); ++i) {
+      if (used[i]) continue;
+
+      const KRoute& cand = uniq[i];
+      const double q = quality01(cand.cost);
+
+      double maxSim = 0.0;
+      for (const auto& sel : out) {
+        maxSim = std::max(maxSim, routeNodeJaccard01(cand.path, sel.path, ignoreEndpoints));
+      }
+      maxSim = std::clamp(maxSim, 0.0, 1.0);
+      const double diversity01 = 1.0 - maxSim;
+      const double score = (1.0 - alpha) * q + alpha * diversity01;
+
+      bool take = false;
+      if (bestIdx == (std::size_t)-1) {
+        take = true;
+      } else if (score > bestScore + 1e-12) {
+        take = true;
+      } else if (std::abs(score - bestScore) <= 1e-12) {
+        // Deterministic tie-break.
+        const KRoute& best = uniq[bestIdx];
+        if (cand.cost < best.cost - 1e-12) {
+          take = true;
+        } else if (std::abs(cand.cost - best.cost) <= 1e-12 && pathLexLess(cand.path, best.path)) {
+          take = true;
+        }
+      }
+
+      if (take) {
+        bestIdx = i;
+        bestScore = score;
+      }
+    }
+
+    if (bestIdx == (std::size_t)-1) break;
+    used[bestIdx] = true;
+    out.push_back(uniq[bestIdx]);
+  }
+
+  return out;
+}
+
+std::vector<KRoute> plotKRoutesAStarCostDiversified(const std::vector<SystemStub>& nodes,
+                                                   SystemId startId,
+                                                   SystemId goalId,
+                                                   double maxJumpLy,
+                                                   double costPerJump,
+                                                   double costPerLy,
+                                                   std::size_t k,
+                                                   double diversityWeight01,
+                                                   std::size_t kCandidates,
+                                                   bool ignoreEndpoints,
+                                                   std::size_t maxExpansionsPerSolve) {
+  if (k == 0) return {};
+
+  if (kCandidates == 0) {
+    kCandidates = std::max<std::size_t>(k, k * 6);
+  }
+  if (kCandidates < k) kCandidates = k;
+
+  const auto candidates = plotKRoutesAStarCost(nodes,
+                                               startId,
+                                               goalId,
+                                               maxJumpLy,
+                                               costPerJump,
+                                               costPerLy,
+                                               kCandidates,
+                                               maxExpansionsPerSolve);
+
+  return selectDiversifiedKRoutesMMR(candidates, k, diversityWeight01, ignoreEndpoints);
 }
 
 double routeDistanceLy(const std::vector<SystemStub>& nodes,

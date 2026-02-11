@@ -91,3 +91,28 @@ Verify:
 ## Round 19
 - `include/stellar/sim/MissileDefense.h` / `src/sim/MissileDefense.cpp`: added deterministic multi-threat point-defense engagement scheduler `planPointDefenseEngagement()` (shot sequence with cooldown + per-shot intercept feasibility).
 - `tests/test_point_defense_engagement.cpp`: regression tests for two-shot scheduling and a cooldown-limited horizon case.
+
+
+## Round 20
+- `include/stellar/sim/BearingTrack.h`: added `BearingTrackSolveDiagnostics` + `bearingTrackSolveDiagnostics()` helper exposing the same weight/determinant solvability gates used by `updateBearingTrack()`.
+- `include/stellar/sim/CrossFixPlanner.h`: added a deterministic cross-fix waypoint recommender for bearing-only tracks (preferred + alternate side) with baseline selection from sigma or range guess.
+- `tests/test_bearing_track_diagnostics.cpp`: regression tests for solvability gate + progress behavior.
+- `tests/test_cross_fix_planner.cpp`: regression tests for baseline selection, perpendicular move directions, expected bearing change, and deterministic side selection.
+
+## Round 21
+- Added BearingTrack uncertainty ellipsoid helper (principal axes + sigma lengths) for visualizing bearing-only fix conditioning.
+- Upgraded CrossFixPlanner with optional predicted information-gain mode: can compute predicted solvability/conditioning per candidate, choose side, and optionally optimize baseline.
+- Added tests covering uncertainty ellipsoid behavior and cross-fix prediction/baseline optimization.
+
+## Round 22
+- `include/stellar/sim/NavRoute.h` / `src/sim/NavRoute.cpp`: exposed hard routing constraints for A* planners (ban nodes + undirected edges) to support avoid-lists and detour analysis.
+- `include/stellar/sim/NavRouteResilience.h`: added replacement-path style edge-detour resilience report ("best route if a jump fails").
+- `tests/test_nav_route_resilience.cpp`: regression test covering deterministic detour selection and critical-edge detection.
+
+## Round 23
+- `include/stellar/sim/NavRoute.h` / `src/sim/NavRoute.cpp`: added MMR-style diversified K-route selection (`selectDiversifiedKRoutesMMR`) plus a convenience wrapper (`plotKRoutesAStarCostDiversified`).
+- `tests/test_nav_route_diversified_k.cpp`: regression tests validating the cost-vs-diversity tradeoff and deterministic behavior.
+
+## Round 24
+- `include/stellar/sim/NavRouteConnectivity.h`: added deterministic edge-disjoint routing analysis (unit-capacity max-flow) with a minimum-cut report. Supports the same banned node/edge constraints as constrained A* routing.
+- `tests/test_nav_route_edge_disjoint.cpp`: regression tests for 3-way edge-disjoint corridors, banned-edge behavior, and deterministic min-cut extraction.

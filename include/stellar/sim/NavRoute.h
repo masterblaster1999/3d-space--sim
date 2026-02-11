@@ -98,6 +98,69 @@ std::vector<SystemId> plotRouteAStarCostHazards(const std::vector<SystemStub>& n
                                                RoutePlanStats* outStats = nullptr,
                                                std::size_t maxExpansions = 250000);
 
+
+// -----------------------------------------------------------------------------
+// Hard route constraints
+// -----------------------------------------------------------------------------
+//
+// These helpers let callers exclude specific systems and/or specific jump links
+// from routing. This is useful for:
+//   - avoiding hostile or locked-down systems
+//   - plotting around dynamic hazards / interdictions
+//   - "no-fly" corridors (ban edges)
+//
+// IMPORTANT:
+//  - Constraints are *hard* exclusions (not soft penalties).
+//  - `bannedEdges` are treated as *undirected*: {a,b} blocks both a->b and b->a.
+//  - The heuristic remains admissible because constraints only remove options.
+//
+// A jump edge to disallow.
+struct RouteEdge {
+  SystemId from{0};
+  SystemId to{0};
+
+  bool operator==(const RouteEdge& o) const { return from == o.from && to == o.to; }
+};
+
+// Constrained variants of the A* route planners.
+std::vector<SystemId> plotRouteAStarCostConstrained(const std::vector<SystemStub>& nodes,
+                                                   SystemId startId,
+                                                   SystemId goalId,
+                                                   double maxJumpLy,
+                                                   double costPerJump,
+                                                   double costPerLy,
+                                                   std::span<const SystemId> bannedNodes,
+                                                   std::span<const RouteEdge> bannedEdges,
+                                                   RoutePlanStats* outStats = nullptr,
+                                                   std::size_t maxExpansions = 250000);
+
+std::vector<SystemId> plotRouteAStarCostRiskConstrained(const std::vector<SystemStub>& nodes,
+                                                       SystemId startId,
+                                                       SystemId goalId,
+                                                       double maxJumpLy,
+                                                       double costPerJump,
+                                                       double costPerLy,
+                                                       double riskWeightPerLy,
+                                                       std::span<const double> risk01PerNode,
+                                                       std::span<const SystemId> bannedNodes,
+                                                       std::span<const RouteEdge> bannedEdges,
+                                                       RoutePlanStats* outStats = nullptr,
+                                                       std::size_t maxExpansions = 250000);
+
+std::vector<SystemId> plotRouteAStarCostHazardsConstrained(const std::vector<SystemStub>& nodes,
+                                                          SystemId startId,
+                                                          SystemId goalId,
+                                                          double maxJumpLy,
+                                                          double costPerJump,
+                                                          double costPerLy,
+                                                          double hazardWeightPerLy,
+                                                          core::u64 universeSeed,
+                                                          double timeDays,
+                                                          std::span<const SystemId> bannedNodes,
+                                                          std::span<const RouteEdge> bannedEdges,
+                                                          RoutePlanStats* outStats = nullptr,
+                                                          std::size_t maxExpansions = 250000);
+
 // Result for K-shortest route planning.
 struct KRoute {
   std::vector<SystemId> path;
@@ -157,6 +220,47 @@ std::vector<KRoute> plotKRoutesAStarHops(const std::vector<SystemStub>& nodes,
                                         double maxJumpLy,
                                         std::size_t k,
                                         std::size_t maxExpansionsPerSolve = 250000);
+
+// -----------------------------------------------------------------------------
+// Diversified K-route selection (MMR-style)
+// -----------------------------------------------------------------------------
+//
+// K-shortest routes are often very similar (differing by only a hop or two).
+// For UI/AI purposes it is useful to present alternate routes that are
+// meaningfully different.
+//
+// This helper selects up to k routes from a candidate set by trading off
+// cost optimality vs path diversity.
+//
+// Diversity is measured as:
+//   diversity = 1 - max_j routeNodeJaccard01(candidate, selected[j])
+//
+// `diversityWeight01` in [0,1]:
+//   0 -> purely cost-ordered selection (first k unique routes)
+//   1 -> greedily maximize diversity vs already-selected routes
+//
+// Determinism:
+//  - ties are broken by (lower cost, then lexicographic SystemId path order).
+std::vector<KRoute> selectDiversifiedKRoutesMMR(std::span<const KRoute> candidates,
+                                                std::size_t k,
+                                                double diversityWeight01 = 0.65,
+                                                bool ignoreEndpoints = true);
+
+// Convenience: compute a larger candidate set (kCandidates) with Yen's
+// algorithm and then diversify down to k.
+//
+// If kCandidates==0, it defaults to max(k, k*6).
+std::vector<KRoute> plotKRoutesAStarCostDiversified(const std::vector<SystemStub>& nodes,
+                                                   SystemId startId,
+                                                   SystemId goalId,
+                                                   double maxJumpLy,
+                                                   double costPerJump,
+                                                   double costPerLy,
+                                                   std::size_t k,
+                                                   double diversityWeight01 = 0.65,
+                                                   std::size_t kCandidates = 0,
+                                                   bool ignoreEndpoints = true,
+                                                   std::size_t maxExpansionsPerSolve = 250000);
 
 // Helper: total straight-line length of a route in ly.
 // Returns 0 for empty/single-node routes.

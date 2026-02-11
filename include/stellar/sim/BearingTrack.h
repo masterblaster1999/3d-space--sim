@@ -1,6 +1,7 @@
 #pragma once
 
 #include "stellar/math/Mat3.h"
+#include "stellar/math/SymmetricEigen3.h"
 #include "stellar/math/Vec3.h"
 
 #include <algorithm>
@@ -124,6 +125,182 @@ inline double maxAbsElement(const math::Mat3d& M) {
   double m = 0.0;
   for (double v : M.m) m = std::max(m, std::abs(v));
   return m;
+}
+
+
+// Diagnostics helper for UI/tools: expose the same solvability gates used by
+// updateBearingTrack() without mutating the track.
+//
+// This is useful for cross-fix workflows where the caller wants to show
+// progress toward a solvable geometry before a unique position estimate exists.
+struct BearingTrackSolveDiagnostics {
+  double effectiveWeight{0.0};
+  double minEffectiveWeight{0.0};
+
+  // Determinant of the unregularized normal matrix A.
+  double detAbs{0.0};
+  double detThresh{0.0};
+  double scale{0.0};
+
+  bool weightOk{false};
+  bool detOk{false};
+  bool canSolve{false};
+
+  // Normalized progress metrics in [0,1].
+  double weightProgress01{0.0};
+  double detProgress01{0.0};
+  double progress01{0.0};
+};
+
+inline BearingTrackSolveDiagnostics bearingTrackSolveDiagnostics(const BearingTrack3d& track,
+                                                                const BearingTrackParams& params = {}) {
+  BearingTrackSolveDiagnostics out{};
+
+  out.effectiveWeight = track.weight;
+  out.minEffectiveWeight = params.minEffectiveWeight;
+
+  const double wMin = (std::isfinite(params.minEffectiveWeight) && params.minEffectiveWeight > 0.0)
+                        ? params.minEffectiveWeight
+                        : 0.0;
+
+  out.weightOk = (wMin <= 0.0) ? true : (track.weight >= wMin);
+  out.weightProgress01 = (wMin <= 1.0e-12) ? 1.0 : clamp01(track.weight / wMin);
+
+  const double scale = std::max(1.0, maxAbsElement(track.A));
+  out.scale = scale;
+
+  double detEps = params.determinantEps;
+  if (!std::isfinite(detEps) || detEps < 0.0) detEps = 0.0;
+
+  out.detThresh = detEps * scale * scale * scale;
+  out.detAbs = std::abs(track.A.determinant());
+
+  out.detOk = (out.detAbs > out.detThresh);
+  if (out.detThresh <= 0.0) {
+    // If the threshold is zero, treat any non-zero determinant as "full" progress.
+    out.detProgress01 = (out.detAbs > 0.0) ? 1.0 : 0.0;
+  } else {
+    out.detProgress01 = clamp01(out.detAbs / out.detThresh);
+  }
+
+  out.canSolve = out.weightOk && out.detOk;
+  out.progress01 = std::min(out.weightProgress01, out.detProgress01);
+  return out;
+}
+
+// -----------------------------------------------------------------------------
+// BearingTrack uncertainty ellipsoid (principal axes)
+// -----------------------------------------------------------------------------
+//
+// This is a lightweight helper for tools/UI that want to visualize "how uncertain"
+// a bearing-only fix is (or how directionally ill-conditioned the geometry is).
+//
+// If we interpret the normal matrix A as an information matrix, then a rough
+// position covariance estimate is:
+//   Cov ~= sigma^2 * A^{-1}
+// where sigma is the (perpendicular) measurement noise scale.
+//
+// Because A is symmetric, eigenvectors of A are eigenvectors of Cov, and the
+// corresponding covariance eigenvalues are sigma^2 / lambda_i.
+
+struct BearingTrackUncertaintyEllipsoidParams {
+  // If > 0, use this sigma scale (km).
+  // If <= 0, use track.sigmaKm if it is finite and > 0, otherwise fall back to 1.
+  double sigmaScaleKm{-1.0};
+
+  // Minimum eigenvalue (information) used when inverting. This prevents
+  // infinite axes for rank-deficient geometries (e.g. a single bearing).
+  double minInfoEigenvalue{1.0e-12};
+
+  // Clamp output axis lengths (km) for UI stability.
+  double maxAxisKm{1.0e9};
+};
+
+struct BearingTrackUncertaintyEllipsoid {
+  bool valid{false};
+
+  // Principal axes (unit vectors) as columns.
+  math::Mat3d axes{math::Mat3d::identity()};
+
+  // Eigenvalues of the information matrix A (ascending).
+  math::Vec3d infoEigenvalues{0, 0, 0};
+
+  // Corresponding covariance eigenvalues (km^2) and 1-sigma semi-axis lengths (km).
+  // These are aligned with `axes` / `infoEigenvalues` (same column order).
+  math::Vec3d varianceAxisKm2{0, 0, 0};
+  math::Vec3d sigmaAxisKm{0, 0, 0};
+
+  // Condition number of the information matrix (lambdaMax / lambdaMinClamped).
+  double conditionNumber{0.0};
+
+  // Sigma scale actually used (km).
+  double sigmaScaleKm{1.0};
+};
+
+inline BearingTrackUncertaintyEllipsoid bearingTrackUncertaintyEllipsoid(
+  const BearingTrack3d& track,
+  const BearingTrackUncertaintyEllipsoidParams& params = {}) {
+
+  BearingTrackUncertaintyEllipsoid out{};
+  if (!track.A.isFinite()) return out;
+
+  const math::SymmetricEigen3Result eig = math::symmetricEigenDecomposition3x3(track.A);
+  if (!eig.valid) return out;
+
+  double sigma = params.sigmaScaleKm;
+  if (!(std::isfinite(sigma) && sigma > 0.0)) {
+    sigma = (std::isfinite(track.sigmaKm) && track.sigmaKm > 0.0) ? track.sigmaKm : 1.0;
+  }
+
+  double minEig = params.minInfoEigenvalue;
+  if (!std::isfinite(minEig) || minEig <= 0.0) minEig = 1.0e-18;
+
+  double maxAxis = params.maxAxisKm;
+  if (!std::isfinite(maxAxis) || maxAxis <= 0.0) maxAxis = 1.0e12;
+
+  out.axes = eig.eigenvectors;
+  out.infoEigenvalues = eig.eigenvalues;
+  out.sigmaScaleKm = sigma;
+
+  const double sigma2 = sigma * sigma;
+
+  auto invClamp = [&](double lambda) {
+    double l = lambda;
+    if (!std::isfinite(l) || l < minEig) l = minEig;
+    return std::max(l, minEig);
+  };
+
+  const double l0 = invClamp(out.infoEigenvalues.x);
+  const double l1 = invClamp(out.infoEigenvalues.y);
+  const double l2 = invClamp(out.infoEigenvalues.z);
+
+  const double v0 = sigma2 / l0;
+  const double v1 = sigma2 / l1;
+  const double v2 = sigma2 / l2;
+
+  out.varianceAxisKm2 = {
+    (std::isfinite(v0) && v0 >= 0.0) ? v0 : (maxAxis * maxAxis),
+    (std::isfinite(v1) && v1 >= 0.0) ? v1 : (maxAxis * maxAxis),
+    (std::isfinite(v2) && v2 >= 0.0) ? v2 : (maxAxis * maxAxis),
+  };
+
+  auto toSigma = [&](double var) {
+    double s = (std::isfinite(var) && var >= 0.0) ? std::sqrt(var) : maxAxis;
+    if (!std::isfinite(s)) s = maxAxis;
+    return std::clamp(s, 0.0, maxAxis);
+  };
+
+  out.sigmaAxisKm = {
+    toSigma(out.varianceAxisKm2.x),
+    toSigma(out.varianceAxisKm2.y),
+    toSigma(out.varianceAxisKm2.z),
+  };
+
+  out.conditionNumber = (l0 > 0.0) ? (l2 / l0) : 0.0;
+  if (!std::isfinite(out.conditionNumber)) out.conditionNumber = 0.0;
+
+  out.valid = true;
+  return out;
 }
 
 // Update the bearing-only track.
